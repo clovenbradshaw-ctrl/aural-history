@@ -274,7 +274,7 @@ function mergeAdjacentBlocks(blockList) {
     // Merge if same effective speaker; for unattributed blocks also check
     // that there's no significant pause (> 1.5s gap = new paragraph)
     const gap = bStart(blockList[i]) - bEnd(result[result.length - 1]);
-    const sameGroup = prevEff === currEff && (prevEff != null || gap < 1.5);
+    const sameGroup = prevEff === currEff && (prevEff != null || gap < 10);
     if (sameGroup) {
       const prev = result[result.length - 1];
       prev.segments = [...prev.segments, ...blockList[i].segments];
