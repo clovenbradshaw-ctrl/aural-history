@@ -256,6 +256,38 @@ const C = {
   - Display merges segment texts into flowing paragraph
 */
 
+/* ── Merge adjacent blocks with the same effective speaker into paragraphs ── */
+function mergeAdjacentBlocks(blockList) {
+  if (blockList.length <= 1) return blockList;
+  const eff = blockList.map((b, i) => {
+    if (b.speaker) return b.speaker;
+    for (let j = i - 1; j >= 0; j--) { if (blockList[j].speaker) return blockList[j].speaker; }
+    return null;
+  });
+  const bEnd = (b) => Math.max(...b.segments.map((s) => s.end));
+  const bStart = (b) => Math.min(...b.segments.map((s) => s.start));
+  const result = [{ ...blockList[0], segments: [...blockList[0].segments] }];
+  let resultEff = [eff[0]];
+  for (let i = 1; i < blockList.length; i++) {
+    const prevEff = resultEff[resultEff.length - 1];
+    const currEff = eff[i];
+    // Merge if same effective speaker; for unattributed blocks also check
+    // that there's no significant pause (> 1.5s gap = new paragraph)
+    const gap = bStart(blockList[i]) - bEnd(result[result.length - 1]);
+    const sameGroup = prevEff === currEff && (prevEff != null || gap < 10);
+    if (sameGroup) {
+      const prev = result[result.length - 1];
+      prev.segments = [...prev.segments, ...blockList[i].segments];
+      prev.wasMoved = prev.wasMoved || blockList[i].wasMoved;
+      prev.wasEdited = prev.wasEdited || blockList[i].wasEdited;
+    } else {
+      result.push({ ...blockList[i], segments: [...blockList[i].segments] });
+      resultEff.push(currEff);
+    }
+  }
+  return result;
+}
+
 export default function OralHistoryEditor() {
   const [blocks, setBlocks] = useState([]);
   const [audioUrl, setAudioUrl] = useState(null);
@@ -404,7 +436,7 @@ export default function OralHistoryEditor() {
         const newBlocks = allSegs.map((seg) => ({
           id: uid(), speaker: null, segments: [seg], wasMoved: false, wasEdited: false,
         }));
-        setBlocks(newBlocks);
+        setBlocks(mergeAdjacentBlocks(newBlocks));
         setTranscriptionProgress({ completed: i + 1, total: totalChunks, segments: allSegs });
         setSyncMsg(`Transcribed chunk ${i + 1}/${totalChunks} — ${allSegs.length} segments`);
       }
@@ -445,7 +477,7 @@ export default function OralHistoryEditor() {
         wasMoved: false,
         wasEdited: false,
       }));
-      setBlocks(newBlocks);
+      setBlocks(mergeAdjacentBlocks(newBlocks));
       setSelected(new Set());
       setUndoStack([]);
     };
@@ -572,31 +604,7 @@ export default function OralHistoryEditor() {
   }, [selected, pushUndo]);
 
   /* ── Auto-merge adjacent same-speaker blocks ── */
-  const mergeAdjacent = useCallback((blockList) => {
-    if (blockList.length <= 1) return blockList;
-    // Compute effective speakers for the list
-    const eff = blockList.map((b, i) => {
-      if (b.speaker) return b.speaker;
-      for (let j = i - 1; j >= 0; j--) { if (blockList[j].speaker) return blockList[j].speaker; }
-      return null;
-    });
-    const result = [{ ...blockList[0], segments: [...blockList[0].segments] }];
-    let resultEff = [eff[0]];
-    for (let i = 1; i < blockList.length; i++) {
-      const prevEff = resultEff[resultEff.length - 1];
-      const currEff = eff[i];
-      if (prevEff && prevEff === currEff) {
-        const prev = result[result.length - 1];
-        prev.segments = [...prev.segments, ...blockList[i].segments];
-        prev.wasMoved = prev.wasMoved || blockList[i].wasMoved;
-        prev.wasEdited = prev.wasEdited || blockList[i].wasEdited;
-      } else {
-        result.push({ ...blockList[i], segments: [...blockList[i].segments] });
-        resultEff.push(currEff);
-      }
-    }
-    return result;
-  }, []);
+  const mergeAdjacent = useCallback((blockList) => mergeAdjacentBlocks(blockList), []);
 
   /* After speaker assignment, auto-merge */
   const assignAndMerge = useCallback((sid) => {
