@@ -99,7 +99,9 @@ export default function OralHistoryEditor() {
   const [webhookBase, setWebhookBase] = useState("https://n8n.intelechia.com/webhook/oral-history");
   const [driveFileId, setDriveFileId] = useState("");
   const [syncStatus, setSyncStatus] = useState(null); // null | "saving" | "loading" | "saved" | "loaded" | "error"
-  const [syncMsg, setSyncMsg] = useState("");
+  const [syncMsg, _setSyncMsg] = useState("");
+  const syncMsgRef = useRef("");
+  const setSyncMsg = useCallback((v) => { syncMsgRef.current = v; _setSyncMsg(v); }, []);
   const [projectTitle, setProjectTitle] = useState("Untitled Oral History");
   const [openaiApiKey, setOpenaiApiKey] = useState("");
   const [transcribing, setTranscribing] = useState(false);
@@ -133,13 +135,27 @@ export default function OralHistoryEditor() {
       setTimeout(() => setSyncStatus(null), 3000); return;
     }
     setTranscribing(true);
-    setSyncStatus("saving"); setSyncMsg("Transcribing audio…");
+    const startTime = Date.now();
+    const elapsed = () => {
+      const s = Math.floor((Date.now() - startTime) / 1000);
+      return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
+    };
+    setSyncStatus("saving"); setSyncMsg("Preparing audio for upload…");
+    // Show elapsed time while transcribing
+    const timer = setInterval(() => {
+      if (syncMsgRef.current) {
+        const base = syncMsgRef.current.replace(/ \(\d+[ms].*?\)$/, "");
+        setSyncMsg(`${base} (${elapsed()})`);
+      }
+    }, 1000);
     try {
       const formData = new FormData();
       formData.append("file", audioFileRef.current);
       formData.append("model", "whisper-1");
       formData.append("response_format", "verbose_json");
       formData.append("timestamp_granularities[]", "segment");
+      const fileSizeMB = (audioFileRef.current.size / (1024 * 1024)).toFixed(1);
+      setSyncMsg(`Uploading ${fileSizeMB} MB to OpenAI…`);
       const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
         method: "POST",
         headers: { Authorization: `Bearer ${openaiApiKey.trim()}` },
@@ -149,6 +165,7 @@ export default function OralHistoryEditor() {
         const err = await res.json().catch(() => ({}));
         throw new Error(err.error?.message || `API error ${res.status}`);
       }
+      setSyncMsg(`Transcription complete, processing results… (${elapsed()})`);
       const data = await res.json();
       const segs = (data.segments || []).map((seg, i) => ({
         id: uid(), text: seg.text.trim(), originalText: seg.text.trim(),
@@ -162,9 +179,11 @@ export default function OralHistoryEditor() {
       setSelected(new Set());
       setUndoStack([]);
       setSubName("(transcribed)");
-      setSyncStatus("loaded"); setSyncMsg(`Transcribed ${segs.length} segments`);
-      setTimeout(() => setSyncStatus(null), 3000);
+      clearInterval(timer);
+      setSyncStatus("loaded"); setSyncMsg(`Transcribed ${segs.length} segments in ${elapsed()}`);
+      setTimeout(() => setSyncStatus(null), 4000);
     } catch (err) {
+      clearInterval(timer);
       setSyncStatus("error"); setSyncMsg(err.message);
       setTimeout(() => setSyncStatus(null), 5000);
     } finally {
@@ -795,6 +814,7 @@ export default function OralHistoryEditor() {
             borderRadius: 4, display: "inline-block",
             background: syncStatus === "error" ? "rgba(179,64,64,0.08)" : C.accentDim,
             color: syncStatus === "error" ? C.danger : C.accent,
+            ...(transcribing ? { animation: "pulse 2s ease-in-out infinite" } : {}),
           }}>
             {syncMsg}
           </div>
