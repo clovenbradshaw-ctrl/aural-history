@@ -266,15 +266,27 @@ function mergeAdjacentBlocks(blockList) {
   });
   const bEnd = (b) => Math.max(...b.segments.map((s) => s.end));
   const bStart = (b) => Math.min(...b.segments.map((s) => s.start));
+  const bText = (b) => b.segments.map((s) => s.text).join(" ");
   const result = [{ ...blockList[0], segments: [...blockList[0].segments] }];
   let resultEff = [eff[0]];
   for (let i = 1; i < blockList.length; i++) {
     const prevEff = resultEff[resultEff.length - 1];
     const currEff = eff[i];
-    // Merge if same effective speaker; for unattributed blocks also check
-    // that there's no significant pause (> 1.5s gap = new paragraph)
     const gap = bStart(blockList[i]) - bEnd(result[result.length - 1]);
-    const sameGroup = prevEff === currEff && (prevEff != null || gap < 10);
+    let sameGroup;
+    if (prevEff !== currEff) {
+      sameGroup = false;
+    } else if (prevEff != null) {
+      // Same attributed speaker — always merge
+      sameGroup = true;
+    } else {
+      // Both unattributed — merge into paragraphs using sentence + pause heuristic.
+      // Only break when the previous block ends a sentence AND there's a pause > 2s,
+      // or when there's a very long pause (> 15s) regardless of punctuation.
+      const prevText = bText(result[result.length - 1]).trim();
+      const endsSentence = /[.!?]["''")\]]?\s*$/.test(prevText);
+      sameGroup = gap < 15 && !(endsSentence && gap > 2);
+    }
     if (sameGroup) {
       const prev = result[result.length - 1];
       prev.segments = [...prev.segments, ...blockList[i].segments];
@@ -468,8 +480,17 @@ export default function OralHistoryEditor() {
     setSubName(f.name);
     const reader = new FileReader();
     reader.onload = (ev) => {
+      // Handle JSON project files as transcript imports
+      if (f.name.endsWith(".json")) {
+        try {
+          const proj = JSON.parse(ev.target.result);
+          if (proj.blocks && Array.isArray(proj.blocks)) {
+            restoreProject(proj);
+            return;
+          }
+        } catch (err) { /* not valid JSON, fall through to subtitle parsing */ }
+      }
       const segments = detectAndParse(ev.target.result);
-      // Each segment becomes its own block initially (unassigned speaker)
       const newBlocks = segments.map((seg) => ({
         id: uid(),
         speaker: null,
@@ -529,7 +550,7 @@ export default function OralHistoryEditor() {
         originalIndex: seg.originalIndex || 0,
       })),
     }));
-    setBlocks(restored);
+    setBlocks(mergeAdjacentBlocks(restored));
     if (proj.sourceFile) setAudioName(proj.sourceFile);
     if (proj.title) setProjectTitle(proj.title);
     setSelected(new Set());
@@ -1049,7 +1070,7 @@ export default function OralHistoryEditor() {
           </div>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
             <UploadBtn onChange={handleAudioUpload} accept="audio/*" label={audioName ? `◆ ${audioName.slice(0, 18)}` : "↑ Audio"} />
-            <UploadBtn onChange={handleSubUpload} accept=".srt,.vtt,.txt" label={subName ? `◆ ${subName.slice(0, 18)}` : "↑ Subtitles"} />
+            <UploadBtn onChange={handleSubUpload} accept=".srt,.vtt,.txt,.json" label={subName ? `◆ ${subName.slice(0, 18)}` : "↑ Subtitles"} />
             {audioUrl && !transcribing && (
               <SmBtn onClick={() => transcribeAudio(!!transcriptionProgress)} accent>
                 {transcriptionProgress ? "⟳ Resume" : "⟳ Transcribe"}
@@ -1187,7 +1208,7 @@ export default function OralHistoryEditor() {
                 const isEd = editingSpeakerId === spk.id;
                 return (
                   <div key={spk.id}
-                    onClick={() => { if (selected.size > 0 && !isEd) assignAndMerge(spk.id); }}
+                    onClick={() => { if (selected.size > 0 && !isEd) assignAndMerge(spk.id); else if (selected.size === 0 && !isEd) { setEditingSpeakerId(spk.id); setEditingSpeakerName(spk.name); } }}
                     style={{
                       padding: "5px 16px", display: "flex", alignItems: "center", gap: 7,
                       cursor: selected.size > 0 ? "pointer" : "default",
@@ -1294,8 +1315,8 @@ export default function OralHistoryEditor() {
                 onDrop={() => handleDrop(block.id)}
                 onDragEnd={() => { setDragging(null); setDragOver(null); }}
                 style={{
-                  marginBottom: 6,
-                  padding: "14px 20px",
+                  marginBottom: spk ? 16 : 4,
+                  padding: "10px 20px",
                   borderRadius: 6,
                   background: isSelected ? C.selected : "transparent",
                   border: `1px solid ${isDragTarget ? C.accent : isSelected ? C.selectedBorder : "transparent"}`,
@@ -1316,11 +1337,7 @@ export default function OralHistoryEditor() {
                     }}>
                       {spk.name}{isInherited ? " (cont.)" : ""}
                     </span>
-                  ) : (
-                    <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: C.border, fontStyle: "italic" }}>
-                      unattributed
-                    </span>
-                  )}
+                  ) : null}
                   <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim }}>
                     {fmtTime(blockStart(block))} — {fmtTime(blockEnd(block))}
                   </span>
