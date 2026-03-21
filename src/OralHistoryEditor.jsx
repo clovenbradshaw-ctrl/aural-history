@@ -41,7 +41,68 @@ function detectAndParse(text) {
 /* ── Audio chunking for streaming transcription ── */
 const CHUNK_DURATION = 5 * 60; // 5 minutes per chunk
 
+/**
+ * Probe the audio file by decoding a small initial slice to get sample rate,
+ * channel count, and estimate total duration without loading the whole file.
+ */
+async function probeAudioFile(file) {
+  // Read up to 1 MB to decode enough header + samples for metadata
+  const probeSize = Math.min(file.size, 1024 * 1024);
+  const probeBuf = await file.slice(0, probeSize).arrayBuffer();
+  const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  try {
+    const decoded = await audioCtx.decodeAudioData(probeBuf);
+    const sampleRate = decoded.sampleRate;
+    const numChannels = decoded.numberOfChannels;
+    // Estimate total duration from file size using decoded bitrate
+    const probeDuration = decoded.duration;
+    const bytesPerSecond = probeSize / probeDuration;
+    const estimatedDuration = file.size / bytesPerSecond;
+    return { sampleRate, numChannels, estimatedDuration };
+  } finally {
+    audioCtx.close();
+  }
+}
+
 async function sliceAudioFile(file, chunkDuration = CHUNK_DURATION) {
+  // For small files (< 50 MB), use the simple in-memory approach
+  if (file.size < 50 * 1024 * 1024) {
+    return sliceAudioFileInMemory(file, chunkDuration);
+  }
+
+  // For large files, slice by byte ranges to avoid loading everything into memory
+  const { sampleRate, numChannels, estimatedDuration } = await probeAudioFile(file);
+  const totalChunks = Math.ceil(estimatedDuration / chunkDuration);
+  const bytesPerChunk = Math.floor(file.size / totalChunks);
+  const chunks = [];
+
+  for (let i = 0; i < totalChunks; i++) {
+    const byteStart = i * bytesPerChunk;
+    const byteEnd = i === totalChunks - 1 ? file.size : (i + 1) * bytesPerChunk;
+    const blob = file.slice(byteStart, byteEnd);
+    const chunkStart = i * chunkDuration;
+
+    // Decode this slice to re-encode as a clean WAV chunk
+    const sliceBuf = await blob.arrayBuffer();
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    try {
+      const decoded = await audioCtx.decodeAudioData(sliceBuf);
+      const channelData = [];
+      for (let ch = 0; ch < decoded.numberOfChannels; ch++) {
+        channelData.push(decoded.getChannelData(ch));
+      }
+      const wavBlob = encodeWAV(channelData, decoded.sampleRate, decoded.numberOfChannels);
+      const chunkFile = new File([wavBlob], `chunk_${i}.wav`, { type: "audio/wav" });
+      chunks.push({ file: chunkFile, startOffset: chunkStart, index: i });
+    } finally {
+      audioCtx.close();
+    }
+  }
+
+  return chunks;
+}
+
+async function sliceAudioFileInMemory(file, chunkDuration) {
   const arrayBuf = await file.arrayBuffer();
   const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
   const decoded = await audioCtx.decodeAudioData(arrayBuf);
@@ -54,13 +115,11 @@ async function sliceAudioFile(file, chunkDuration = CHUNK_DURATION) {
   for (let offset = 0; offset < totalSamples; offset += chunkSamples) {
     const length = Math.min(chunkSamples, totalSamples - offset);
     const chunkStart = offset / sampleRate;
-    // Extract channel data for this chunk
     const channelData = [];
     for (let ch = 0; ch < numChannels; ch++) {
       const full = decoded.getChannelData(ch);
       channelData.push(full.slice(offset, offset + length));
     }
-    // Encode as WAV blob
     const wavBlob = encodeWAV(channelData, sampleRate, numChannels);
     const chunkFile = new File([wavBlob], `chunk_${chunks.length}.wav`, { type: "audio/wav" });
     chunks.push({ file: chunkFile, startOffset: chunkStart, index: chunks.length });
@@ -102,6 +161,9 @@ function encodeWAV(channelData, sampleRate, numChannels) {
   }
   return new Blob([buffer], { type: "audio/wav" });
 }
+
+/* ── Hardcoded API webhook base URL ── */
+const WEBHOOK_BASE = "https://n8n.intelechia.com/webhook/oral-history";
 
 /* ── Speaker Colors ── */
 const SPEAKER_PALETTE = [
@@ -161,7 +223,7 @@ export default function OralHistoryEditor() {
 
   // Cloud sync & project
   const [showSettings, setShowSettings] = useState(false);
-  const [webhookBase, setWebhookBase] = useState("https://n8n.intelechia.com/webhook/oral-history");
+  const webhookBase = WEBHOOK_BASE;
   const [driveFileId, setDriveFileId] = useState("");
   const [syncStatus, setSyncStatus] = useState(null); // null | "saving" | "loading" | "saved" | "loaded" | "error"
   const [syncMsg, _setSyncMsg] = useState("");
@@ -988,12 +1050,6 @@ export default function OralHistoryEditor() {
             <label style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim }}>Project Title</label>
             <input value={projectTitle} onChange={(e) => setProjectTitle(e.target.value)}
               style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, padding: "4px 8px", background: C.surface, border: `1px solid ${C.border}`, borderRadius: 4, color: C.text, width: 200 }} />
-          </div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
-            <label style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim }}>n8n Webhook Base URL</label>
-            <input value={webhookBase} onChange={(e) => setWebhookBase(e.target.value)}
-              placeholder="https://your-n8n.app/webhook/..."
-              style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, padding: "4px 8px", background: C.surface, border: `1px solid ${C.border}`, borderRadius: 4, color: C.text, width: 320 }} />
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
             <label style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim }}>OpenAI API Key</label>
