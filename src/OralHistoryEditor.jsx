@@ -38,6 +38,71 @@ function detectAndParse(text) {
   return text.trimStart().startsWith("WEBVTT") ? parseVTT(text) : parseSRT(text);
 }
 
+/* ── Audio chunking for streaming transcription ── */
+const CHUNK_DURATION = 5 * 60; // 5 minutes per chunk
+
+async function sliceAudioFile(file, chunkDuration = CHUNK_DURATION) {
+  const arrayBuf = await file.arrayBuffer();
+  const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const decoded = await audioCtx.decodeAudioData(arrayBuf);
+  const sampleRate = decoded.sampleRate;
+  const numChannels = decoded.numberOfChannels;
+  const totalSamples = decoded.length;
+  const chunkSamples = Math.floor(chunkDuration * sampleRate);
+  const chunks = [];
+
+  for (let offset = 0; offset < totalSamples; offset += chunkSamples) {
+    const length = Math.min(chunkSamples, totalSamples - offset);
+    const chunkStart = offset / sampleRate;
+    // Extract channel data for this chunk
+    const channelData = [];
+    for (let ch = 0; ch < numChannels; ch++) {
+      const full = decoded.getChannelData(ch);
+      channelData.push(full.slice(offset, offset + length));
+    }
+    // Encode as WAV blob
+    const wavBlob = encodeWAV(channelData, sampleRate, numChannels);
+    const chunkFile = new File([wavBlob], `chunk_${chunks.length}.wav`, { type: "audio/wav" });
+    chunks.push({ file: chunkFile, startOffset: chunkStart, index: chunks.length });
+  }
+
+  audioCtx.close();
+  return chunks;
+}
+
+function encodeWAV(channelData, sampleRate, numChannels) {
+  const numSamples = channelData[0].length;
+  const bytesPerSample = 2; // 16-bit
+  const dataSize = numSamples * numChannels * bytesPerSample;
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+
+  const writeStr = (off, str) => { for (let i = 0; i < str.length; i++) view.setUint8(off + i, str.charCodeAt(i)); };
+  writeStr(0, "RIFF");
+  view.setUint32(4, 36 + dataSize, true);
+  writeStr(8, "WAVE");
+  writeStr(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true); // PCM
+  view.setUint16(22, numChannels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * numChannels * bytesPerSample, true);
+  view.setUint16(32, numChannels * bytesPerSample, true);
+  view.setUint16(34, 16, true);
+  writeStr(36, "data");
+  view.setUint32(40, dataSize, true);
+
+  let pos = 44;
+  for (let i = 0; i < numSamples; i++) {
+    for (let ch = 0; ch < numChannels; ch++) {
+      const sample = Math.max(-1, Math.min(1, channelData[ch][i]));
+      view.setInt16(pos, sample < 0 ? sample * 0x8000 : sample * 0x7FFF, true);
+      pos += 2;
+    }
+  }
+  return new Blob([buffer], { type: "audio/wav" });
+}
+
 /* ── Speaker Colors ── */
 const SPEAKER_PALETTE = [
   { color: "#c9a55a", bg: "rgba(201,165,90,0.06)" },
@@ -99,10 +164,15 @@ export default function OralHistoryEditor() {
   const [webhookBase, setWebhookBase] = useState("https://n8n.intelechia.com/webhook/oral-history");
   const [driveFileId, setDriveFileId] = useState("");
   const [syncStatus, setSyncStatus] = useState(null); // null | "saving" | "loading" | "saved" | "loaded" | "error"
-  const [syncMsg, setSyncMsg] = useState("");
+  const [syncMsg, _setSyncMsg] = useState("");
+  const syncMsgRef = useRef("");
+  const setSyncMsg = useCallback((v) => { syncMsgRef.current = v; _setSyncMsg(v); }, []);
   const [projectTitle, setProjectTitle] = useState("Untitled Oral History");
   const [openaiApiKey, setOpenaiApiKey] = useState("");
   const [transcribing, setTranscribing] = useState(false);
+  const [transcriptionProgress, setTranscriptionProgress] = useState(null); // { completed, total, segments }
+  const [autoSaveEnabled, setAutoSaveEnabled] = useState(false);
+  const autoSaveTimerRef = useRef(null);
 
   const audioRef = useRef(null);
   const audioFileRef = useRef(null);
@@ -110,6 +180,7 @@ export default function OralHistoryEditor() {
   const newSpkRef = useRef(null);
   const editSpkRef = useRef(null);
   const projectUploadRef = useRef(null);
+  const transcribeCancelRef = useRef(false);
 
   /* ── File handling ── */
   const handleAudioUpload = (e) => {
@@ -122,7 +193,7 @@ export default function OralHistoryEditor() {
     if (audioRef.current) audioRef.current.src = url;
   };
 
-  const transcribeAudio = async () => {
+  const transcribeAudio = async (resume = false) => {
     if (!audioFileRef.current) {
       setSyncStatus("error"); setSyncMsg("Upload an audio file first");
       setTimeout(() => setSyncStatus(null), 3000); return;
@@ -132,41 +203,106 @@ export default function OralHistoryEditor() {
       setSyncStatus("error"); setSyncMsg("Enter your OpenAI API key in Settings");
       setTimeout(() => setSyncStatus(null), 3000); return;
     }
+    transcribeCancelRef.current = false;
     setTranscribing(true);
-    setSyncStatus("saving"); setSyncMsg("Transcribing audio…");
-    try {
-      const formData = new FormData();
-      formData.append("file", audioFileRef.current);
-      formData.append("model", "whisper-1");
-      formData.append("response_format", "verbose_json");
-      formData.append("timestamp_granularities[]", "segment");
-      const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-        method: "POST",
-        headers: { Authorization: `Bearer ${openaiApiKey.trim()}` },
-        body: formData,
-      });
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.error?.message || `API error ${res.status}`);
+    const startTime = Date.now();
+    const elapsed = () => {
+      const s = Math.floor((Date.now() - startTime) / 1000);
+      return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
+    };
+    setSyncStatus("saving"); setSyncMsg("Decoding audio…");
+    const timer = setInterval(() => {
+      if (syncMsgRef.current) {
+        const base = syncMsgRef.current.replace(/ \(\d+[ms].*?\)$/, "");
+        setSyncMsg(`${base} (${elapsed()})`);
       }
-      const data = await res.json();
-      const segs = (data.segments || []).map((seg, i) => ({
-        id: uid(), text: seg.text.trim(), originalText: seg.text.trim(),
-        start: seg.start, end: seg.end, originalIndex: i,
-      }));
-      if (segs.length === 0) throw new Error("No segments returned");
-      const newBlocks = segs.map((seg) => ({
-        id: uid(), speaker: null, segments: [seg], wasMoved: false, wasEdited: false,
-      }));
-      setBlocks(newBlocks);
-      setSelected(new Set());
-      setUndoStack([]);
+    }, 1000);
+
+    try {
+      // Split audio into chunks
+      const chunks = await sliceAudioFile(audioFileRef.current);
+      const totalChunks = chunks.length;
+
+      // Determine where to resume from
+      let startChunk = 0;
+      let allSegs = [];
+      if (resume && transcriptionProgress && transcriptionProgress.segments.length > 0) {
+        startChunk = transcriptionProgress.completed;
+        allSegs = [...transcriptionProgress.segments];
+        setSyncMsg(`Resuming from chunk ${startChunk + 1} of ${totalChunks}…`);
+      } else {
+        setTranscriptionProgress({ completed: 0, total: totalChunks, segments: [] });
+        setBlocks([]);
+        setSelected(new Set());
+        setUndoStack([]);
+      }
+
+      setSyncMsg(`Transcribing chunk 1 of ${totalChunks}…`);
+
+      for (let i = startChunk; i < totalChunks; i++) {
+        if (transcribeCancelRef.current) {
+          setSyncMsg(`Paused after ${i} of ${totalChunks} chunks — ${allSegs.length} segments so far`);
+          setSyncStatus("loaded");
+          clearInterval(timer);
+          setTranscribing(false);
+          return;
+        }
+
+        const chunk = chunks[i];
+        setSyncMsg(`Transcribing chunk ${i + 1} of ${totalChunks}…`);
+
+        const formData = new FormData();
+        formData.append("file", chunk.file);
+        formData.append("model", "whisper-1");
+        formData.append("response_format", "verbose_json");
+        formData.append("timestamp_granularities[]", "segment");
+
+        const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${openaiApiKey.trim()}` },
+          body: formData,
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.error?.message || `API error ${res.status} on chunk ${i + 1}`);
+        }
+        const data = await res.json();
+        const chunkSegs = (data.segments || []).map((seg, j) => ({
+          id: uid(),
+          text: seg.text.trim(),
+          originalText: seg.text.trim(),
+          start: seg.start + chunk.startOffset,
+          end: seg.end + chunk.startOffset,
+          originalIndex: allSegs.length + j,
+        }));
+
+        allSegs = [...allSegs, ...chunkSegs];
+
+        // Update blocks progressively so user sees results stream in
+        const newBlocks = allSegs.map((seg) => ({
+          id: uid(), speaker: null, segments: [seg], wasMoved: false, wasEdited: false,
+        }));
+        setBlocks(newBlocks);
+        setTranscriptionProgress({ completed: i + 1, total: totalChunks, segments: allSegs });
+        setSyncMsg(`Transcribed chunk ${i + 1}/${totalChunks} — ${allSegs.length} segments`);
+      }
+
+      if (allSegs.length === 0) throw new Error("No segments returned");
       setSubName("(transcribed)");
-      setSyncStatus("loaded"); setSyncMsg(`Transcribed ${segs.length} segments`);
-      setTimeout(() => setSyncStatus(null), 3000);
+      setTranscriptionProgress(null);
+      clearInterval(timer);
+      setSyncStatus("loaded"); setSyncMsg(`Transcribed ${allSegs.length} segments in ${elapsed()}`);
+      setTimeout(() => setSyncStatus(null), 4000);
     } catch (err) {
-      setSyncStatus("error"); setSyncMsg(err.message);
-      setTimeout(() => setSyncStatus(null), 5000);
+      clearInterval(timer);
+      // Keep progress so user can resume
+      setSyncStatus("error");
+      const prog = transcriptionProgress;
+      const resumeHint = prog && prog.completed > 0
+        ? ` (${prog.completed}/${prog.total} chunks done — click Transcribe to resume)`
+        : "";
+      setSyncMsg(err.message + resumeHint);
+      setTimeout(() => setSyncStatus(null), 8000);
     } finally {
       setTranscribing(false);
     }
@@ -694,6 +830,20 @@ export default function OralHistoryEditor() {
     }
   }, [webhookBase, driveFileId]);
 
+  /* ── Periodic auto-save ── */
+  const AUTO_SAVE_INTERVAL = 3 * 60 * 1000; // 3 minutes
+  useEffect(() => {
+    if (autoSaveTimerRef.current) clearInterval(autoSaveTimerRef.current);
+    if (autoSaveEnabled && webhookBase && blocks.length > 0) {
+      autoSaveTimerRef.current = setInterval(() => {
+        // Don't auto-save while actively transcribing or during another sync
+        if (syncStatus === "saving" || syncStatus === "loading") return;
+        cloudSave();
+      }, AUTO_SAVE_INTERVAL);
+    }
+    return () => { if (autoSaveTimerRef.current) clearInterval(autoSaveTimerRef.current); };
+  }, [autoSaveEnabled, webhookBase, blocks.length, cloudSave, syncStatus]);
+
   /* ── Export: Markdown ── */
   const generateMarkdown = useCallback(() => {
     let md = `# ${projectTitle}\n\n`;
@@ -770,15 +920,28 @@ export default function OralHistoryEditor() {
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
             <UploadBtn onChange={handleAudioUpload} accept="audio/*" label={audioName ? `◆ ${audioName.slice(0, 18)}` : "↑ Audio"} />
             <UploadBtn onChange={handleSubUpload} accept=".srt,.vtt,.txt" label={subName ? `◆ ${subName.slice(0, 18)}` : "↑ Subtitles"} />
-            {audioUrl && <SmBtn onClick={transcribeAudio} accent disabled={transcribing}>
-              {transcribing ? "…Transcribing" : "⟳ Transcribe"}
-            </SmBtn>}
+            {audioUrl && !transcribing && (
+              <SmBtn onClick={() => transcribeAudio(!!transcriptionProgress)} accent>
+                {transcriptionProgress ? "⟳ Resume" : "⟳ Transcribe"}
+              </SmBtn>
+            )}
+            {transcribing && (
+              <SmBtn onClick={() => { transcribeCancelRef.current = true; }}>
+                ■ Pause
+              </SmBtn>
+            )}
             <div style={{ width: 1, height: 20, background: C.border, margin: "0 2px" }} />
             <UploadBtn onChange={handleProjectUpload} accept=".json" label="↑ Load Project" />
             {hasContent && <SmBtn onClick={downloadProject} accent>↓ Save Project</SmBtn>}
             {hasContent && webhookBase && (
               <SmBtn onClick={cloudSave} accent>
                 {syncStatus === "saving" ? "…" : "☁ Save"}
+              </SmBtn>
+            )}
+            {hasContent && webhookBase && (
+              <SmBtn onClick={() => setAutoSaveEnabled(!autoSaveEnabled)}
+                accent={autoSaveEnabled}>
+                {autoSaveEnabled ? "☁ Auto ✓" : "☁ Auto"}
               </SmBtn>
             )}
             <button onClick={() => setShowSettings(!showSettings)} style={{
@@ -790,13 +953,27 @@ export default function OralHistoryEditor() {
         </div>
         {/* Sync status */}
         {syncStatus && (
-          <div style={{
-            marginTop: 8, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 10px",
-            borderRadius: 4, display: "inline-block",
-            background: syncStatus === "error" ? "rgba(179,64,64,0.08)" : C.accentDim,
-            color: syncStatus === "error" ? C.danger : C.accent,
-          }}>
-            {syncMsg}
+          <div style={{ marginTop: 8, display: "inline-flex", alignItems: "center", gap: 8 }}>
+            <div style={{
+              fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 10px",
+              borderRadius: 4, display: "inline-block",
+              background: syncStatus === "error" ? "rgba(179,64,64,0.08)" : C.accentDim,
+              color: syncStatus === "error" ? C.danger : C.accent,
+              ...(transcribing ? { animation: "pulse 2s ease-in-out infinite" } : {}),
+            }}>
+              {syncMsg}
+            </div>
+            {transcribing && transcriptionProgress && transcriptionProgress.total > 1 && (
+              <div style={{
+                width: 120, height: 6, background: C.border, borderRadius: 3, overflow: "hidden",
+              }}>
+                <div style={{
+                  width: `${(transcriptionProgress.completed / transcriptionProgress.total) * 100}%`,
+                  height: "100%", background: C.accent, borderRadius: 3,
+                  transition: "width 0.3s ease",
+                }} />
+              </div>
+            )}
           </div>
         )}
       </header>
