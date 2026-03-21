@@ -560,7 +560,8 @@ export default function OralHistoryEditor() {
 
   return (
     <div style={{ fontFamily: "'Newsreader', Georgia, serif", background: C.bg, color: C.text, minHeight: "100vh", display: "flex", flexDirection: "column" }}>
-      <style>{fonts}{`
+      <style>{fonts + `
+        html, body, #root { height: 100%; margin: 0; }
         *, *::before, *::after { box-sizing: border-box; margin: 0; }
         ::selection { background: rgba(139,105,20,0.15); }
         ::-webkit-scrollbar { width: 6px; }
