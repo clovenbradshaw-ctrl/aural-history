@@ -45,13 +45,20 @@ const CHUNK_DURATION = 5 * 60; // 5 minutes per chunk
  * Probe the audio file by decoding a small initial slice to get sample rate,
  * channel count, and estimate total duration without loading the whole file.
  */
-async function probeAudioFile(file) {
+async function probeAudioFile(file, onProgress) {
+  onProgress?.("Probing audio file for metadata…");
   // Read up to 1 MB to decode enough header + samples for metadata
   const probeSize = Math.min(file.size, 1024 * 1024);
   const probeBuf = await file.slice(0, probeSize).arrayBuffer();
   const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
   try {
-    const decoded = await audioCtx.decodeAudioData(probeBuf);
+    onProgress?.("Decoding audio header…");
+    let decoded;
+    try {
+      decoded = await audioCtx.decodeAudioData(probeBuf);
+    } catch (e) {
+      throw new Error(`Could not decode "${file.name}" — the file may be corrupted or in an unsupported format (try MP3, WAV, M4A, OGG, or FLAC)`);
+    }
     const sampleRate = decoded.sampleRate;
     const numChannels = decoded.numberOfChannels;
     // Estimate total duration from file size using decoded bitrate
@@ -64,19 +71,23 @@ async function probeAudioFile(file) {
   }
 }
 
-async function sliceAudioFile(file, chunkDuration = CHUNK_DURATION) {
+async function sliceAudioFile(file, chunkDuration = CHUNK_DURATION, onProgress) {
   // For small files (< 50 MB), use the simple in-memory approach
   if (file.size < 50 * 1024 * 1024) {
-    return sliceAudioFileInMemory(file, chunkDuration);
+    return sliceAudioFileInMemory(file, chunkDuration, onProgress);
   }
 
   // For large files, slice by byte ranges to avoid loading everything into memory
-  const { sampleRate, numChannels, estimatedDuration } = await probeAudioFile(file);
+  const { sampleRate, numChannels, estimatedDuration } = await probeAudioFile(file, onProgress);
   const totalChunks = Math.ceil(estimatedDuration / chunkDuration);
   const bytesPerChunk = Math.floor(file.size / totalChunks);
   const chunks = [];
+  const fileSizeMB = (file.size / (1024 * 1024)).toFixed(0);
+
+  onProgress?.(`Splitting ${fileSizeMB} MB file into ${totalChunks} chunks…`);
 
   for (let i = 0; i < totalChunks; i++) {
+    onProgress?.(`Decoding chunk ${i + 1} of ${totalChunks}…`);
     const byteStart = i * bytesPerChunk;
     const byteEnd = i === totalChunks - 1 ? file.size : (i + 1) * bytesPerChunk;
     const blob = file.slice(byteStart, byteEnd);
@@ -86,11 +97,17 @@ async function sliceAudioFile(file, chunkDuration = CHUNK_DURATION) {
     const sliceBuf = await blob.arrayBuffer();
     const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     try {
-      const decoded = await audioCtx.decodeAudioData(sliceBuf);
+      let decoded;
+      try {
+        decoded = await audioCtx.decodeAudioData(sliceBuf);
+      } catch (e) {
+        throw new Error(`Failed to decode chunk ${i + 1} of ${totalChunks} — the audio file may be corrupted at byte offset ${byteStart}`);
+      }
       const channelData = [];
       for (let ch = 0; ch < decoded.numberOfChannels; ch++) {
         channelData.push(decoded.getChannelData(ch));
       }
+      onProgress?.(`Encoding chunk ${i + 1} of ${totalChunks} as WAV…`);
       const wavBlob = encodeWAV(channelData, decoded.sampleRate, decoded.numberOfChannels);
       const chunkFile = new File([wavBlob], `chunk_${i}.wav`, { type: "audio/wav" });
       chunks.push({ file: chunkFile, startOffset: chunkStart, index: i });
@@ -102,31 +119,47 @@ async function sliceAudioFile(file, chunkDuration = CHUNK_DURATION) {
   return chunks;
 }
 
-async function sliceAudioFileInMemory(file, chunkDuration) {
+async function sliceAudioFileInMemory(file, chunkDuration, onProgress) {
+  const fileSizeMB = (file.size / (1024 * 1024)).toFixed(1);
+  onProgress?.(`Reading ${fileSizeMB} MB audio file into memory…`);
   const arrayBuf = await file.arrayBuffer();
   const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-  const decoded = await audioCtx.decodeAudioData(arrayBuf);
-  const sampleRate = decoded.sampleRate;
-  const numChannels = decoded.numberOfChannels;
-  const totalSamples = decoded.length;
-  const chunkSamples = Math.floor(chunkDuration * sampleRate);
-  const chunks = [];
-
-  for (let offset = 0; offset < totalSamples; offset += chunkSamples) {
-    const length = Math.min(chunkSamples, totalSamples - offset);
-    const chunkStart = offset / sampleRate;
-    const channelData = [];
-    for (let ch = 0; ch < numChannels; ch++) {
-      const full = decoded.getChannelData(ch);
-      channelData.push(full.slice(offset, offset + length));
+  try {
+    onProgress?.(`Decoding ${fileSizeMB} MB audio file…`);
+    let decoded;
+    try {
+      decoded = await audioCtx.decodeAudioData(arrayBuf);
+    } catch (e) {
+      throw new Error(`Could not decode "${file.name}" — the file may be corrupted or in an unsupported format (try MP3, WAV, M4A, OGG, or FLAC)`);
     }
-    const wavBlob = encodeWAV(channelData, sampleRate, numChannels);
-    const chunkFile = new File([wavBlob], `chunk_${chunks.length}.wav`, { type: "audio/wav" });
-    chunks.push({ file: chunkFile, startOffset: chunkStart, index: chunks.length });
-  }
+    const sampleRate = decoded.sampleRate;
+    const numChannels = decoded.numberOfChannels;
+    const totalSamples = decoded.length;
+    const chunkSamples = Math.floor(chunkDuration * sampleRate);
+    const totalChunks = Math.ceil(totalSamples / chunkSamples);
+    const chunks = [];
 
-  audioCtx.close();
-  return chunks;
+    onProgress?.(`Splitting into ${totalChunks} chunks (${Math.round(decoded.duration / 60)} min audio, ${sampleRate} Hz, ${numChannels}ch)…`);
+
+    for (let offset = 0; offset < totalSamples; offset += chunkSamples) {
+      const chunkIndex = chunks.length;
+      onProgress?.(`Encoding chunk ${chunkIndex + 1} of ${totalChunks} as WAV…`);
+      const length = Math.min(chunkSamples, totalSamples - offset);
+      const chunkStart = offset / sampleRate;
+      const channelData = [];
+      for (let ch = 0; ch < numChannels; ch++) {
+        const full = decoded.getChannelData(ch);
+        channelData.push(full.slice(offset, offset + length));
+      }
+      const wavBlob = encodeWAV(channelData, sampleRate, numChannels);
+      const chunkFile = new File([wavBlob], `chunk_${chunkIndex}.wav`, { type: "audio/wav" });
+      chunks.push({ file: chunkFile, startOffset: chunkStart, index: chunkIndex });
+    }
+
+    return chunks;
+  } finally {
+    audioCtx.close();
+  }
 }
 
 function encodeWAV(channelData, sampleRate, numChannels) {
@@ -272,7 +305,7 @@ export default function OralHistoryEditor() {
       const s = Math.floor((Date.now() - startTime) / 1000);
       return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
     };
-    setSyncStatus("saving"); setSyncMsg("Decoding audio…");
+    setSyncStatus("saving"); setSyncMsg("Preparing audio…");
     const timer = setInterval(() => {
       if (syncMsgRef.current) {
         const base = syncMsgRef.current.replace(/ \(\d+[ms].*?\)$/, "");
@@ -282,7 +315,7 @@ export default function OralHistoryEditor() {
 
     try {
       // Split audio into chunks
-      const chunks = await sliceAudioFile(audioFileRef.current);
+      const chunks = await sliceAudioFile(audioFileRef.current, CHUNK_DURATION, setSyncMsg);
       const totalChunks = chunks.length;
 
       // Determine where to resume from
