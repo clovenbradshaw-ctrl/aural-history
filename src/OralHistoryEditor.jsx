@@ -94,10 +94,19 @@ export default function OralHistoryEditor() {
   // Export panel
   const [showExport, setShowExport] = useState(false);
 
+  // Cloud sync & project
+  const [showSettings, setShowSettings] = useState(false);
+  const [webhookBase, setWebhookBase] = useState("https://n8n.intelechia.com/webhook/oral-history");
+  const [driveFileId, setDriveFileId] = useState("");
+  const [syncStatus, setSyncStatus] = useState(null); // null | "saving" | "loading" | "saved" | "loaded" | "error"
+  const [syncMsg, setSyncMsg] = useState("");
+  const [projectTitle, setProjectTitle] = useState("Untitled Oral History");
+
   const audioRef = useRef(null);
   const playTimerRef = useRef(null);
   const newSpkRef = useRef(null);
   const editSpkRef = useRef(null);
+  const projectUploadRef = useRef(null);
 
   /* ── File handling ── */
   const handleAudioUpload = (e) => {
@@ -129,6 +138,61 @@ export default function OralHistoryEditor() {
       setUndoStack([]);
     };
     reader.readAsText(f);
+  };
+
+  /* ── Load project from JSON file ── */
+  const handleProjectUpload = (e) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const proj = JSON.parse(ev.target.result);
+        restoreProject(proj);
+      } catch (err) {
+        setSyncStatus("error");
+        setSyncMsg("Invalid project file");
+        setTimeout(() => setSyncStatus(null), 3000);
+      }
+    };
+    reader.readAsText(f);
+    e.target.value = "";
+  };
+
+  const restoreProject = (proj) => {
+    if (!proj.blocks || !Array.isArray(proj.blocks)) return;
+    if (proj.speakers && Array.isArray(proj.speakers)) {
+      setSpeakers(proj.speakers.map((s) => ({
+        id: s.id || uid(),
+        name: s.name,
+        color: s.color || SPEAKER_PALETTE[0].color,
+        bg: SPEAKER_PALETTE.find((p) => p.color === s.color)?.bg || SPEAKER_PALETTE[0].bg,
+      })));
+    }
+    const spkNameToId = {};
+    (proj.speakers || []).forEach((s) => { spkNameToId[s.name] = s.id || uid(); });
+    const restored = proj.blocks.map((b) => ({
+      id: uid(),
+      speaker: b.speakerId || (b.speaker ? spkNameToId[b.speaker] : null) || null,
+      wasMoved: b.wasMoved || false,
+      wasEdited: b.wasEdited || false,
+      segments: (b.segments || []).map((seg) => ({
+        id: uid(),
+        text: seg.text,
+        originalText: seg.originalText || seg.text,
+        start: seg.sourceStart,
+        end: seg.sourceEnd,
+        originalIndex: seg.originalIndex || 0,
+      })),
+    }));
+    setBlocks(restored);
+    if (proj.sourceFile) setAudioName(proj.sourceFile);
+    if (proj.title) setProjectTitle(proj.title);
+    setSelected(new Set());
+    setUndoStack([]);
+    setSyncStatus("loaded");
+    setSyncMsg("Project loaded");
+    setTimeout(() => setSyncStatus(null), 2000);
   };
 
   /* ── Undo ── */
@@ -487,9 +551,98 @@ export default function OralHistoryEditor() {
   useEffect(() => { if (addingSpeaker && newSpkRef.current) newSpkRef.current.focus(); }, [addingSpeaker]);
   useEffect(() => { if (editingSpeakerId && editSpkRef.current) editSpkRef.current.focus(); }, [editingSpeakerId]);
 
+  /* ── Full project state for save ── */
+  const buildProjectState = useCallback(() => {
+    const speakerMap = {};
+    speakers.forEach((s) => { speakerMap[s.id] = s.name; });
+    return {
+      version: 1,
+      title: projectTitle,
+      sourceFile: audioName || "source.wav",
+      totalDuration: +(blocks.reduce((sum, b) => sum + b.segments.reduce((s2, seg) => s2 + (seg.end - seg.start), 0), 0)).toFixed(3),
+      speakers: speakers.map((s) => ({ id: s.id, name: s.name, color: s.color })),
+      blocks: blocks.map((b, i) => {
+        let effId = b.speaker;
+        if (!effId) { for (let j = i - 1; j >= 0; j--) { if (blocks[j].speaker) { effId = blocks[j].speaker; break; } } }
+        return {
+          order: i + 1,
+          speaker: effId ? (speakerMap[effId] || null) : null,
+          speakerId: b.speaker,
+          explicitSpeaker: !!b.speaker,
+          text: b.segments.map((s) => s.text).join(" "),
+          wasEdited: b.wasEdited,
+          wasMoved: b.wasMoved,
+          segments: b.segments.map((seg) => ({
+            text: seg.text, originalText: seg.originalText,
+            sourceStart: +seg.start.toFixed(3), sourceEnd: +seg.end.toFixed(3),
+            duration: +((seg.end - seg.start).toFixed(3)),
+            originalIndex: seg.originalIndex,
+          })),
+        };
+      }),
+    };
+  }, [blocks, speakers, audioName, projectTitle]);
+
+  /* ── Cloud sync via n8n webhooks ── */
+  const cloudSave = useCallback(async () => {
+    if (!webhookBase) { setSyncStatus("error"); setSyncMsg("Set webhook URL in settings"); setTimeout(() => setSyncStatus(null), 3000); return; }
+    setSyncStatus("saving");
+    setSyncMsg("Saving to Google Drive…");
+    const proj = buildProjectState();
+    try {
+      const isUpdate = !!driveFileId;
+      const url = isUpdate
+        ? `${webhookBase.replace(/\/$/, "")}-update`
+        : webhookBase;
+      const body = {
+        fileName: `${projectTitle.replace(/[^a-zA-Z0-9_ -]/g, "")}.json`,
+        content: JSON.stringify(proj, null, 2),
+        ...(isUpdate ? { fileId: driveFileId } : {}),
+      };
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (data.id) setDriveFileId(data.id);
+      setSyncStatus("saved");
+      setSyncMsg("Saved to Google Drive");
+      setTimeout(() => setSyncStatus(null), 3000);
+    } catch (err) {
+      setSyncStatus("error");
+      setSyncMsg("Save failed: " + err.message);
+      setTimeout(() => setSyncStatus(null), 4000);
+    }
+  }, [webhookBase, driveFileId, buildProjectState, projectTitle]);
+
+  const cloudLoad = useCallback(async () => {
+    if (!webhookBase || !driveFileId) { setSyncStatus("error"); setSyncMsg("Set webhook URL and file ID in settings"); setTimeout(() => setSyncStatus(null), 3000); return; }
+    setSyncStatus("loading");
+    setSyncMsg("Loading from Google Drive…");
+    try {
+      const url = `${webhookBase.replace(/\/$/, "")}-load?fileId=${driveFileId}`;
+      const res = await fetch(url);
+      const data = await res.json();
+      if (data.content) {
+        const proj = typeof data.content === "string" ? JSON.parse(data.content) : data.content;
+        restoreProject(proj);
+      } else {
+        restoreProject(data);
+      }
+      setSyncStatus("loaded");
+      setSyncMsg("Loaded from Google Drive");
+      setTimeout(() => setSyncStatus(null), 3000);
+    } catch (err) {
+      setSyncStatus("error");
+      setSyncMsg("Load failed: " + err.message);
+      setTimeout(() => setSyncStatus(null), 4000);
+    }
+  }, [webhookBase, driveFileId]);
+
   /* ── Export: Markdown ── */
   const generateMarkdown = useCallback(() => {
-    let md = `# Oral History Transcript\n\n`;
+    let md = `# ${projectTitle}\n\n`;
     if (audioName) md += `*Source: ${audioName}*\n\n---\n\n`;
     let lastSpeakerName = null;
     blocks.forEach((block, idx) => {
@@ -504,56 +657,32 @@ export default function OralHistoryEditor() {
       lastSpeakerName = name;
     });
     return md;
-  }, [blocks, getEffectiveSpeaker, blockText, audioName]);
+  }, [blocks, getEffectiveSpeaker, blockText, audioName, projectTitle]);
 
   const downloadMarkdown = useCallback(() => {
     const blob = new Blob([generateMarkdown()], { type: "text/markdown" });
     const url = URL.createObjectURL(blob);
-    const a = document.createElement("a"); a.href = url; a.download = "oral-history.md"; a.click();
+    const fn = projectTitle.replace(/[^a-zA-Z0-9_ -]/g, "").replace(/\s+/g, "-").toLowerCase() || "oral-history";
+    const a = document.createElement("a"); a.href = url; a.download = `${fn}.md`; a.click();
     URL.revokeObjectURL(url);
-  }, [generateMarkdown]);
+  }, [generateMarkdown, projectTitle]);
 
   /* ── Export: Project JSON ── */
   const generateProject = useCallback(() => {
-    const speakerMap = {};
-    speakers.forEach((s) => { speakerMap[s.id] = s.name; });
-    return {
-      version: 1,
-      sourceFile: audioName || "source.wav",
-      totalDuration: +totalDuration.toFixed(3),
-      speakers: speakers.map((s) => ({ id: s.id, name: s.name, color: s.color })),
-      blocks: blocks.map((b, i) => {
-        const effId = getEffectiveSpeakerId(i);
-        return {
-          order: i + 1,
-          speaker: effId ? (speakerMap[effId] || null) : null,
-          speakerId: effId,
-          explicitSpeaker: b.speaker ? true : false,
-          text: blockText(b),
-          wasEdited: b.wasEdited,
-          wasMoved: b.wasMoved,
-          segments: b.segments.map((seg) => ({
-            text: seg.text,
-            originalText: seg.originalText,
-            sourceStart: +seg.start.toFixed(3),
-            sourceEnd: +seg.end.toFixed(3),
-            duration: +((seg.end - seg.start).toFixed(3)),
-            originalIndex: seg.originalIndex,
-          })),
-        };
-      }),
-      ffmpeg: blocks.flatMap((b) => b.segments).map((s, i) =>
-        `ffmpeg -ss ${s.start.toFixed(3)} -to ${s.end.toFixed(3)} -i "$INPUT" -c copy /tmp/seg_${String(i).padStart(4, "0")}.wav`
-      ).join("\n") + `\nprintf "file '%s'\\n" /tmp/seg_*.wav > /tmp/list.txt\nffmpeg -f concat -safe 0 -i /tmp/list.txt -c copy output.wav`,
-    };
-  }, [blocks, speakers, audioName, totalDuration, blockText, getEffectiveSpeakerId]);
+    const proj = buildProjectState();
+    proj.ffmpeg = blocks.flatMap((b) => b.segments).map((s, i) =>
+      `ffmpeg -ss ${s.start.toFixed(3)} -to ${s.end.toFixed(3)} -i "$INPUT" -c copy /tmp/seg_${String(i).padStart(4, "0")}.wav`
+    ).join("\n") + `\nprintf "file '%s'\\n" /tmp/seg_*.wav > /tmp/list.txt\nffmpeg -f concat -safe 0 -i /tmp/list.txt -c copy output.wav`;
+    return proj;
+  }, [buildProjectState, blocks]);
 
   const downloadProject = useCallback(() => {
     const blob = new Blob([JSON.stringify(generateProject(), null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
-    const a = document.createElement("a"); a.href = url; a.download = "oral-history-project.json"; a.click();
+    const fn = projectTitle.replace(/[^a-zA-Z0-9_ -]/g, "").replace(/\s+/g, "-").toLowerCase() || "oral-history-project";
+    const a = document.createElement("a"); a.href = url; a.download = `${fn}.json`; a.click();
     URL.revokeObjectURL(url);
-  }, [generateProject]);
+  }, [generateProject, projectTitle]);
 
   /* ── Render ── */
   const hasContent = blocks.length > 0;
@@ -584,12 +713,67 @@ export default function OralHistoryEditor() {
               NARRATIVE AUDIO EDITOR WITH PROVENANCE TRACKING
             </p>
           </div>
-          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-            <UploadBtn onChange={handleAudioUpload} accept="audio/*" label={audioName ? `◆ ${audioName.slice(0, 22)}` : "↑ Upload Audio"} />
-            <UploadBtn onChange={handleSubUpload} accept=".srt,.vtt,.txt" label={subName ? `◆ ${subName.slice(0, 22)}` : "↑ Upload Subtitles"} />
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+            <UploadBtn onChange={handleAudioUpload} accept="audio/*" label={audioName ? `◆ ${audioName.slice(0, 18)}` : "↑ Audio"} />
+            <UploadBtn onChange={handleSubUpload} accept=".srt,.vtt,.txt" label={subName ? `◆ ${subName.slice(0, 18)}` : "↑ Subtitles"} />
+            <div style={{ width: 1, height: 20, background: C.border, margin: "0 2px" }} />
+            <UploadBtn onChange={handleProjectUpload} accept=".json" label="↑ Load Project" />
+            {hasContent && <SmBtn onClick={downloadProject} accent>↓ Save Project</SmBtn>}
+            {hasContent && webhookBase && (
+              <SmBtn onClick={cloudSave} accent>
+                {syncStatus === "saving" ? "…" : "☁ Save"}
+              </SmBtn>
+            )}
+            <button onClick={() => setShowSettings(!showSettings)} style={{
+              fontFamily: "'DM Mono', monospace", fontSize: 13, background: "none",
+              border: `1px solid ${showSettings ? C.accent : C.border}`, borderRadius: 4,
+              color: showSettings ? C.accent : C.textDim, cursor: "pointer", padding: "5px 8px", lineHeight: 1,
+            }} title="Settings">⚙</button>
           </div>
         </div>
+        {/* Sync status */}
+        {syncStatus && (
+          <div style={{
+            marginTop: 8, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "4px 10px",
+            borderRadius: 4, display: "inline-block",
+            background: syncStatus === "error" ? "rgba(179,64,64,0.08)" : C.accentDim,
+            color: syncStatus === "error" ? C.danger : C.accent,
+          }}>
+            {syncMsg}
+          </div>
+        )}
       </header>
+
+      {/* ── Settings Panel ── */}
+      {showSettings && (
+        <div style={{
+          padding: "14px 36px", background: C.raised, borderBottom: `1px solid ${C.border}`,
+          display: "flex", gap: 16, alignItems: "flex-end", flexWrap: "wrap",
+        }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+            <label style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim }}>Project Title</label>
+            <input value={projectTitle} onChange={(e) => setProjectTitle(e.target.value)}
+              style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, padding: "4px 8px", background: C.surface, border: `1px solid ${C.border}`, borderRadius: 4, color: C.text, width: 200 }} />
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+            <label style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim }}>n8n Webhook Base URL</label>
+            <input value={webhookBase} onChange={(e) => setWebhookBase(e.target.value)}
+              placeholder="https://your-n8n.app/webhook/..."
+              style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, padding: "4px 8px", background: C.surface, border: `1px solid ${C.border}`, borderRadius: 4, color: C.text, width: 320 }} />
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+            <label style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim }}>Google Drive File ID</label>
+            <div style={{ display: "flex", gap: 6 }}>
+              <input value={driveFileId} onChange={(e) => setDriveFileId(e.target.value)}
+                placeholder="(auto-set on first save)"
+                style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, padding: "4px 8px", background: C.surface, border: `1px solid ${C.border}`, borderRadius: 4, color: C.text, width: 240 }} />
+              {driveFileId && webhookBase && (
+                <SmBtn onClick={cloudLoad}>{syncStatus === "loading" ? "…" : "☁ Load"}</SmBtn>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── Toolbar ── */}
       {hasContent && (
