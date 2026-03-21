@@ -39,7 +39,27 @@ function detectAndParse(text) {
 }
 
 /* ── Audio chunking for streaming transcription ── */
-const CHUNK_DURATION = 5 * 60; // 5 minutes per chunk
+const MAX_CHUNK_BYTES = 24 * 1024 * 1024; // 24 MB — stay under OpenAI's 25 MB limit
+
+/** Calculate max chunk duration (seconds) that keeps WAV under MAX_CHUNK_BYTES when encoded as mono 16-bit PCM. */
+function maxChunkDuration(sampleRate) {
+  const bytesPerSample = 2; // 16-bit mono
+  return Math.floor((MAX_CHUNK_BYTES - 44) / (sampleRate * bytesPerSample));
+}
+
+/** Downmix multi-channel Float32Arrays to a single mono Float32Array. */
+function downmixToMono(channelData) {
+  if (channelData.length === 1) return channelData[0];
+  const len = channelData[0].length;
+  const mono = new Float32Array(len);
+  const n = channelData.length;
+  for (let i = 0; i < len; i++) {
+    let sum = 0;
+    for (let ch = 0; ch < n; ch++) sum += channelData[ch][i];
+    mono[i] = sum / n;
+  }
+  return mono;
+}
 
 /**
  * Probe the audio file by decoding a small initial slice to get sample rate,
@@ -71,7 +91,7 @@ async function probeAudioFile(file, onProgress) {
   }
 }
 
-async function sliceAudioFile(file, chunkDuration = CHUNK_DURATION, onProgress) {
+async function sliceAudioFile(file, chunkDuration, onProgress) {
   // For small files (< 50 MB), use the simple in-memory approach
   if (file.size < 50 * 1024 * 1024) {
     return sliceAudioFileInMemory(file, chunkDuration, onProgress);
@@ -79,19 +99,21 @@ async function sliceAudioFile(file, chunkDuration = CHUNK_DURATION, onProgress) 
 
   // For large files, slice by byte ranges to avoid loading everything into memory
   const { sampleRate, numChannels, estimatedDuration } = await probeAudioFile(file, onProgress);
-  const totalChunks = Math.ceil(estimatedDuration / chunkDuration);
+  // Use dynamic chunk duration based on sample rate to stay under 25 MB
+  const safeChunkDuration = chunkDuration || maxChunkDuration(sampleRate);
+  const totalChunks = Math.ceil(estimatedDuration / safeChunkDuration);
   const bytesPerChunk = Math.floor(file.size / totalChunks);
   const chunks = [];
   const fileSizeMB = (file.size / (1024 * 1024)).toFixed(0);
 
-  onProgress?.(`Splitting ${fileSizeMB} MB file into ${totalChunks} chunks…`);
+  onProgress?.(`Splitting ${fileSizeMB} MB file into ${totalChunks} chunks (mono, under 24 MB each)…`);
 
   for (let i = 0; i < totalChunks; i++) {
     onProgress?.(`Decoding chunk ${i + 1} of ${totalChunks}…`);
     const byteStart = i * bytesPerChunk;
     const byteEnd = i === totalChunks - 1 ? file.size : (i + 1) * bytesPerChunk;
     const blob = file.slice(byteStart, byteEnd);
-    const chunkStart = i * chunkDuration;
+    const chunkStart = i * safeChunkDuration;
 
     // Decode this slice to re-encode as a clean WAV chunk
     const sliceBuf = await blob.arrayBuffer();
@@ -107,8 +129,10 @@ async function sliceAudioFile(file, chunkDuration = CHUNK_DURATION, onProgress) 
       for (let ch = 0; ch < decoded.numberOfChannels; ch++) {
         channelData.push(decoded.getChannelData(ch));
       }
-      onProgress?.(`Encoding chunk ${i + 1} of ${totalChunks} as WAV…`);
-      const wavBlob = encodeWAV(channelData, decoded.sampleRate, decoded.numberOfChannels);
+      // Downmix to mono to reduce WAV size
+      const mono = downmixToMono(channelData);
+      onProgress?.(`Encoding chunk ${i + 1} of ${totalChunks} as mono WAV…`);
+      const wavBlob = encodeWAV([mono], decoded.sampleRate, 1);
       const chunkFile = new File([wavBlob], `chunk_${i}.wav`, { type: "audio/wav" });
       chunks.push({ file: chunkFile, startOffset: chunkStart, index: i });
     } finally {
@@ -133,25 +157,28 @@ async function sliceAudioFileInMemory(file, chunkDuration, onProgress) {
       throw new Error(`Could not decode "${file.name}" — the file may be corrupted or in an unsupported format (try MP3, WAV, M4A, OGG, or FLAC)`);
     }
     const sampleRate = decoded.sampleRate;
-    const numChannels = decoded.numberOfChannels;
     const totalSamples = decoded.length;
-    const chunkSamples = Math.floor(chunkDuration * sampleRate);
+    // Use dynamic chunk duration based on sample rate to stay under 25 MB
+    const safeChunkDuration = chunkDuration || maxChunkDuration(sampleRate);
+    const chunkSamples = Math.floor(safeChunkDuration * sampleRate);
     const totalChunks = Math.ceil(totalSamples / chunkSamples);
     const chunks = [];
 
-    onProgress?.(`Splitting into ${totalChunks} chunks (${Math.round(decoded.duration / 60)} min audio, ${sampleRate} Hz, ${numChannels}ch)…`);
+    onProgress?.(`Splitting into ${totalChunks} chunks (${Math.round(decoded.duration / 60)} min audio, ${sampleRate} Hz, mono)…`);
 
     for (let offset = 0; offset < totalSamples; offset += chunkSamples) {
       const chunkIndex = chunks.length;
-      onProgress?.(`Encoding chunk ${chunkIndex + 1} of ${totalChunks} as WAV…`);
+      onProgress?.(`Encoding chunk ${chunkIndex + 1} of ${totalChunks} as mono WAV…`);
       const length = Math.min(chunkSamples, totalSamples - offset);
       const chunkStart = offset / sampleRate;
       const channelData = [];
-      for (let ch = 0; ch < numChannels; ch++) {
+      for (let ch = 0; ch < decoded.numberOfChannels; ch++) {
         const full = decoded.getChannelData(ch);
         channelData.push(full.slice(offset, offset + length));
       }
-      const wavBlob = encodeWAV(channelData, sampleRate, numChannels);
+      // Downmix to mono to reduce WAV size
+      const mono = downmixToMono(channelData);
+      const wavBlob = encodeWAV([mono], sampleRate, 1);
       const chunkFile = new File([wavBlob], `chunk_${chunkIndex}.wav`, { type: "audio/wav" });
       chunks.push({ file: chunkFile, startOffset: chunkStart, index: chunkIndex });
     }
@@ -315,7 +342,7 @@ export default function OralHistoryEditor() {
 
     try {
       // Split audio into chunks
-      const chunks = await sliceAudioFile(audioFileRef.current, CHUNK_DURATION, setSyncMsg);
+      const chunks = await sliceAudioFile(audioFileRef.current, null, setSyncMsg);
       const totalChunks = chunks.length;
 
       // Determine where to resume from
