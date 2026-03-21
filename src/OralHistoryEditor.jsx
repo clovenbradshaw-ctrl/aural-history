@@ -101,8 +101,11 @@ export default function OralHistoryEditor() {
   const [syncStatus, setSyncStatus] = useState(null); // null | "saving" | "loading" | "saved" | "loaded" | "error"
   const [syncMsg, setSyncMsg] = useState("");
   const [projectTitle, setProjectTitle] = useState("Untitled Oral History");
+  const [openaiApiKey, setOpenaiApiKey] = useState("");
+  const [transcribing, setTranscribing] = useState(false);
 
   const audioRef = useRef(null);
+  const audioFileRef = useRef(null);
   const playTimerRef = useRef(null);
   const newSpkRef = useRef(null);
   const editSpkRef = useRef(null);
@@ -112,10 +115,61 @@ export default function OralHistoryEditor() {
   const handleAudioUpload = (e) => {
     const f = e.target.files?.[0];
     if (!f) return;
+    audioFileRef.current = f;
     setAudioName(f.name);
     const url = URL.createObjectURL(f);
     setAudioUrl(url);
     if (audioRef.current) audioRef.current.src = url;
+  };
+
+  const transcribeAudio = async () => {
+    if (!audioFileRef.current) {
+      setSyncStatus("error"); setSyncMsg("Upload an audio file first");
+      setTimeout(() => setSyncStatus(null), 3000); return;
+    }
+    if (!openaiApiKey.trim()) {
+      setShowSettings(true);
+      setSyncStatus("error"); setSyncMsg("Enter your OpenAI API key in Settings");
+      setTimeout(() => setSyncStatus(null), 3000); return;
+    }
+    setTranscribing(true);
+    setSyncStatus("saving"); setSyncMsg("Transcribing audio…");
+    try {
+      const formData = new FormData();
+      formData.append("file", audioFileRef.current);
+      formData.append("model", "whisper-1");
+      formData.append("response_format", "verbose_json");
+      formData.append("timestamp_granularities[]", "segment");
+      const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${openaiApiKey.trim()}` },
+        body: formData,
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error?.message || `API error ${res.status}`);
+      }
+      const data = await res.json();
+      const segs = (data.segments || []).map((seg, i) => ({
+        id: uid(), text: seg.text.trim(), originalText: seg.text.trim(),
+        start: seg.start, end: seg.end, originalIndex: i,
+      }));
+      if (segs.length === 0) throw new Error("No segments returned");
+      const newBlocks = segs.map((seg) => ({
+        id: uid(), speaker: null, segments: [seg], wasMoved: false, wasEdited: false,
+      }));
+      setBlocks(newBlocks);
+      setSelected(new Set());
+      setUndoStack([]);
+      setSubName("(transcribed)");
+      setSyncStatus("loaded"); setSyncMsg(`Transcribed ${segs.length} segments`);
+      setTimeout(() => setSyncStatus(null), 3000);
+    } catch (err) {
+      setSyncStatus("error"); setSyncMsg(err.message);
+      setTimeout(() => setSyncStatus(null), 5000);
+    } finally {
+      setTranscribing(false);
+    }
   };
 
   const handleSubUpload = (e) => {
@@ -716,6 +770,9 @@ export default function OralHistoryEditor() {
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
             <UploadBtn onChange={handleAudioUpload} accept="audio/*" label={audioName ? `◆ ${audioName.slice(0, 18)}` : "↑ Audio"} />
             <UploadBtn onChange={handleSubUpload} accept=".srt,.vtt,.txt" label={subName ? `◆ ${subName.slice(0, 18)}` : "↑ Subtitles"} />
+            {audioUrl && <SmBtn onClick={transcribeAudio} accent disabled={transcribing}>
+              {transcribing ? "…Transcribing" : "⟳ Transcribe"}
+            </SmBtn>}
             <div style={{ width: 1, height: 20, background: C.border, margin: "0 2px" }} />
             <UploadBtn onChange={handleProjectUpload} accept=".json" label="↑ Load Project" />
             {hasContent && <SmBtn onClick={downloadProject} accent>↓ Save Project</SmBtn>}
@@ -760,6 +817,12 @@ export default function OralHistoryEditor() {
             <input value={webhookBase} onChange={(e) => setWebhookBase(e.target.value)}
               placeholder="https://your-n8n.app/webhook/..."
               style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, padding: "4px 8px", background: C.surface, border: `1px solid ${C.border}`, borderRadius: 4, color: C.text, width: 320 }} />
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+            <label style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim }}>OpenAI API Key</label>
+            <input value={openaiApiKey} onChange={(e) => setOpenaiApiKey(e.target.value)}
+              type="password" placeholder="sk-..."
+              style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, padding: "4px 8px", background: C.surface, border: `1px solid ${C.border}`, borderRadius: 4, color: C.text, width: 260 }} />
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
             <label style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim }}>Google Drive File ID</label>
@@ -1122,13 +1185,14 @@ function TBtn({ onClick, disabled, label, k, accent }) {
   );
 }
 
-function SmBtn({ onClick, children, accent }) {
+function SmBtn({ onClick, children, accent, disabled }) {
   return (
-    <button onClick={onClick} style={{
+    <button onClick={onClick} disabled={disabled} style={{
       fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "3px 10px",
       background: accent ? C.accentDim : C.raised,
       border: `1px solid ${accent ? C.accent : C.border}`,
-      borderRadius: 4, color: accent ? C.accent : C.textDim, cursor: "pointer",
+      borderRadius: 4, color: accent ? C.accent : C.textDim,
+      cursor: disabled ? "not-allowed" : "pointer", opacity: disabled ? 0.5 : 1,
     }}>
       {children}
     </button>
