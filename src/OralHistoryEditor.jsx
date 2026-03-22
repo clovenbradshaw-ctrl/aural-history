@@ -270,6 +270,12 @@ function mergeAdjacentBlocks(blockList) {
   const result = [{ ...blockList[0], segments: [...blockList[0].segments] }];
   let resultEff = [eff[0]];
   for (let i = 1; i < blockList.length; i++) {
+    // Never merge header blocks
+    if (blockList[i].type === "header" || result[result.length - 1].type === "header") {
+      result.push({ ...blockList[i], segments: [...blockList[i].segments] });
+      resultEff.push(eff[i]);
+      continue;
+    }
     const prevEff = resultEff[resultEff.length - 1];
     const currEff = eff[i];
     const gap = bStart(blockList[i]) - bEnd(result[result.length - 1]);
@@ -581,7 +587,8 @@ export default function OralHistoryEditor() {
       wasMoved: b.wasMoved || false,
       wasEdited: b.wasEdited || false,
       sectionId: b.sectionId || null,
-      segments: (b.segments || []).map((seg) => ({
+      ...(b.type === "header" ? { type: "header", text: b.headerText || b.text || "", level: b.level || 2, segments: [] } : {}),
+      segments: (b.type === "header") ? [] : (b.segments || []).map((seg) => ({
         id: uid(),
         text: seg.text,
         originalText: seg.originalText || seg.text,
@@ -1142,6 +1149,7 @@ export default function OralHistoryEditor() {
           explicitSpeaker: !!b.speaker,
           sectionId: b.sectionId || null,
           type: b.type || "paragraph",
+          ...(b.type === "header" ? { headerText: b.text, level: b.level || 2 } : {}),
           editHistory: b.editHistory || [],
           text: b.segments.map((s) => s.text).join(" "),
           wasEdited: b.wasEdited,
@@ -1332,6 +1340,11 @@ Return ONLY valid JSON, no other text.`;
       let out = "";
       let lastSpeakerName = null;
       blockList.forEach((block, i) => {
+        if (block.type === "header") {
+          const prefix = "#".repeat(block.level || 2);
+          md += `${prefix} ${block.text || "Untitled"}\n\n`;
+          return;
+        }
         const idx = blockIndices ? blockIndices[i] : blocks.indexOf(block);
         const spk = getEffectiveSpeaker(idx);
         const name = spk ? spk.name : "Unknown Speaker";
