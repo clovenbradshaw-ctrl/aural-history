@@ -270,6 +270,12 @@ function mergeAdjacentBlocks(blockList) {
   const result = [{ ...blockList[0], segments: [...blockList[0].segments] }];
   let resultEff = [eff[0]];
   for (let i = 1; i < blockList.length; i++) {
+    // Never merge header blocks
+    if (blockList[i].type === "header" || result[result.length - 1].type === "header") {
+      result.push({ ...blockList[i], segments: [...blockList[i].segments] });
+      resultEff.push(eff[i]);
+      continue;
+    }
     const prevEff = resultEff[resultEff.length - 1];
     const currEff = eff[i];
     const gap = bStart(blockList[i]) - bEnd(result[result.length - 1]);
@@ -340,6 +346,44 @@ export default function OralHistoryEditor() {
   const [autoSaveEnabled, setAutoSaveEnabled] = useState(false);
   const autoSaveTimerRef = useRef(null);
 
+  // Sections
+  const [sections, setSections] = useState([]);
+  const [showTOC, setShowTOC] = useState(true);
+  const [activeSectionId, setActiveSectionId] = useState(null);
+  const [addingSection, setAddingSection] = useState(false);
+  const [newSectionName, setNewSectionName] = useState("");
+  const [editingSectionId, setEditingSectionId] = useState(null);
+  const [editingSectionName, setEditingSectionName] = useState("");
+
+  // Original segments pool (for search/trim features)
+  const [originalSegments, setOriginalSegments] = useState([]);
+
+  // AI provider
+  const [aiProvider, setAiProvider] = useState("anthropic");
+  const [anthropicApiKey, setAnthropicApiKey] = useState("");
+  const [aiAnalyzing, setAiAnalyzing] = useState(false);
+  const [aiSuggestions, setAiSuggestions] = useState(null);
+  const [aiSelectedSections, setAiSelectedSections] = useState(new Set());
+
+  // Source tags
+  const [sourceTags, setSourceTags] = useState({});
+
+  // Source panel search
+  const [sourceSearch, setSourceSearch] = useState("");
+  const [sourceView, setSourceView] = useState("all"); // "all" | "unused" | "bytag"
+  const [showSource, setShowSource] = useState(false);
+
+  // Trim handles
+  const [trimming, setTrimming] = useState(null); // { blockId, edge: "start"|"end", startX, originalTime }
+
+  // Edit history
+  const [expandedEdit, setExpandedEdit] = useState(false);
+
+  // Audio sync
+  const [playingSegId, setPlayingSegId] = useState(null);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [audioDuration, setAudioDuration] = useState(0);
+
   const audioRef = useRef(null);
   const audioFileRef = useRef(null);
   const playTimerRef = useRef(null);
@@ -347,6 +391,9 @@ export default function OralHistoryEditor() {
   const editSpkRef = useRef(null);
   const projectUploadRef = useRef(null);
   const transcribeCancelRef = useRef(false);
+  const newSectionRef = useRef(null);
+  const editSectionRef = useRef(null);
+  const editorContentRef = useRef(null);
 
   /* ── File handling ── */
   const handleAudioUpload = (e) => {
@@ -446,7 +493,7 @@ export default function OralHistoryEditor() {
 
         // Update blocks progressively so user sees results stream in
         const newBlocks = allSegs.map((seg) => ({
-          id: uid(), speaker: null, segments: [seg], wasMoved: false, wasEdited: false,
+          id: uid(), speaker: null, segments: [seg], wasMoved: false, wasEdited: false, sectionId: null,
         }));
         setBlocks(mergeAdjacentBlocks(newBlocks));
         setTranscriptionProgress({ completed: i + 1, total: totalChunks, segments: allSegs });
@@ -454,6 +501,7 @@ export default function OralHistoryEditor() {
       }
 
       if (allSegs.length === 0) throw new Error("No segments returned");
+      setOriginalSegments(allSegs.map(s => ({...s})));
       setSubName("(transcribed)");
       setTranscriptionProgress(null);
       clearInterval(timer);
@@ -491,12 +539,14 @@ export default function OralHistoryEditor() {
         } catch (err) { /* not valid JSON, fall through to subtitle parsing */ }
       }
       const segments = detectAndParse(ev.target.result);
+      setOriginalSegments(segments.map(s => ({...s})));
       const newBlocks = segments.map((seg) => ({
         id: uid(),
         speaker: null,
         segments: [seg],
         wasMoved: false,
         wasEdited: false,
+        sectionId: null,
       }));
       setBlocks(mergeAdjacentBlocks(newBlocks));
       setSelected(new Set());
@@ -534,6 +584,9 @@ export default function OralHistoryEditor() {
         bg: SPEAKER_PALETTE.find((p) => p.color === s.color)?.bg || SPEAKER_PALETTE[0].bg,
       })));
     }
+    if (proj.sections && Array.isArray(proj.sections)) {
+      setSections(proj.sections.map(s => ({ id: s.id || uid(), name: s.name, collapsed: false })));
+    }
     const spkNameToId = {};
     (proj.speakers || []).forEach((s) => { spkNameToId[s.name] = s.id || uid(); });
     const restored = proj.blocks.map((b) => ({
@@ -541,7 +594,9 @@ export default function OralHistoryEditor() {
       speaker: b.speakerId || (b.speaker ? spkNameToId[b.speaker] : null) || null,
       wasMoved: b.wasMoved || false,
       wasEdited: b.wasEdited || false,
-      segments: (b.segments || []).map((seg) => ({
+      sectionId: b.sectionId || null,
+      ...(b.type === "header" ? { type: "header", text: b.headerText || b.text || "", level: b.level || 2, segments: [] } : {}),
+      segments: (b.type === "header") ? [] : (b.segments || []).map((seg) => ({
         id: uid(),
         text: seg.text,
         originalText: seg.originalText || seg.text,
@@ -562,24 +617,41 @@ export default function OralHistoryEditor() {
 
   /* ── Undo ── */
   const pushUndo = useCallback(() => {
-    setUndoStack((prev) => [...prev.slice(-30), JSON.parse(JSON.stringify(blocks))]);
-  }, [blocks]);
+    setUndoStack((prev) => [...prev.slice(-30), { blocks: JSON.parse(JSON.stringify(blocks)), sections: JSON.parse(JSON.stringify(sections)) }]);
+  }, [blocks, sections]);
 
   const undo = useCallback(() => {
     if (undoStack.length === 0) return;
-    setBlocks(undoStack[undoStack.length - 1]);
+    const snapshot = undoStack[undoStack.length - 1];
+    if (snapshot.blocks) {
+      setBlocks(snapshot.blocks);
+      if (snapshot.sections) setSections(snapshot.sections);
+    } else {
+      // Backwards compat with old undo entries that were just block arrays
+      setBlocks(snapshot);
+    }
     setUndoStack((s) => s.slice(0, -1));
     setSelected(new Set());
     setEditingId(null);
   }, [undoStack]);
 
   /* ── Derived data ── */
-  const blockText = useCallback((block) => block.segments.map((s) => s.text).join(" "), []);
-  const blockStart = useCallback((block) => Math.min(...block.segments.map((s) => s.start)), []);
-  const blockEnd = useCallback((block) => Math.max(...block.segments.map((s) => s.end)), []);
-  const blockDuration = useCallback((block) => block.segments.reduce((sum, s) => sum + (s.end - s.start), 0), []);
+  const blockText = useCallback((block) => block.type === "header" ? (block.text || "") : block.segments.map((s) => s.text).join(" "), []);
+  const blockStart = useCallback((block) => block.type === "header" ? 0 : Math.min(...block.segments.map((s) => s.start)), []);
+  const blockEnd = useCallback((block) => block.type === "header" ? 0 : Math.max(...block.segments.map((s) => s.end)), []);
+  const blockDuration = useCallback((block) => block.type === "header" ? 0 : block.segments.reduce((sum, s) => sum + (s.end - s.start), 0), []);
 
   const totalDuration = useMemo(() => blocks.reduce((sum, b) => sum + blockDuration(b), 0), [blocks, blockDuration]);
+
+  const sectionedBlocks = useMemo(() => {
+    const unsectioned = blocks.map((b, i) => ({ block: b, globalIdx: i })).filter(({ block }) => !block.sectionId);
+    const grouped = sections.map(section => ({
+      ...section,
+      blocks: blocks.map((b, i) => ({ block: b, globalIdx: i })).filter(({ block }) => block.sectionId === section.id),
+      duration: blocks.filter(b => b.sectionId === section.id).reduce((sum, b) => sum + b.segments.reduce((s, seg) => s + (seg.end - seg.start), 0), 0),
+    }));
+    return { unsectioned, sections: grouped };
+  }, [blocks, sections]);
 
   const getSpeaker = useCallback((id) => speakers.find((s) => s.id === id) || null, [speakers]);
 
@@ -637,6 +709,45 @@ export default function OralHistoryEditor() {
     setBlocks(mergeAdjacent(updated));
     setSelected(new Set());
   }, [selected, pushUndo, blocks, mergeAdjacent]);
+
+  /* ── Section management ── */
+  const addSection = useCallback((name) => {
+    if (!name.trim()) return;
+    setSections(prev => [...prev, { id: uid(), name: name.trim(), collapsed: false }]);
+    setNewSectionName("");
+    setAddingSection(false);
+  }, []);
+
+  const removeSection = useCallback((sid) => {
+    pushUndo();
+    setSections(prev => prev.filter(s => s.id !== sid));
+    setBlocks(prev => prev.map(b => b.sectionId === sid ? { ...b, sectionId: null } : b));
+  }, [pushUndo]);
+
+  const renameSection = useCallback((sid, name) => {
+    if (!name.trim()) return;
+    setSections(prev => prev.map(s => s.id === sid ? { ...s, name: name.trim() } : s));
+    setEditingSectionId(null);
+  }, []);
+
+  const toggleSectionCollapse = useCallback((sid) => {
+    setSections(prev => prev.map(s => s.id === sid ? { ...s, collapsed: !s.collapsed } : s));
+  }, []);
+
+  /* ── Section assignment ── */
+  const assignToSection = useCallback((sectionId) => {
+    if (selected.size === 0) return;
+    pushUndo();
+    setBlocks(prev => prev.map(b => selected.has(b.id) ? { ...b, sectionId } : b));
+    setSelected(new Set());
+  }, [selected, pushUndo]);
+
+  const unsectionBlocks = useCallback(() => {
+    if (selected.size === 0) return;
+    pushUndo();
+    setBlocks(prev => prev.map(b => selected.has(b.id) ? { ...b, sectionId: null } : b));
+    setSelected(new Set());
+  }, [selected, pushUndo]);
 
   /* ── Selection ── */
   const handleSelect = useCallback((id, e) => {
@@ -699,6 +810,7 @@ export default function OralHistoryEditor() {
       segments: sel.flatMap((b) => b.segments),
       wasMoved: sel.some((b) => b.wasMoved),
       wasEdited: true,
+      sectionId: sel[0].sectionId || null,
     };
     const firstIdx = blocks.findIndex((b) => selected.has(b.id));
     const next = blocks.filter((b) => !selected.has(b.id));
@@ -748,20 +860,130 @@ export default function OralHistoryEditor() {
 
       if (segs1.length === 0 || segs2.length === 0) return prev;
 
-      const b1 = { id: uid(), speaker: block.speaker, segments: segs1, wasMoved: block.wasMoved, wasEdited: true };
-      const b2 = { id: uid(), speaker: block.speaker, segments: segs2, wasMoved: block.wasMoved, wasEdited: true };
+      const b1 = { id: uid(), speaker: block.speaker, segments: segs1, wasMoved: block.wasMoved, wasEdited: true, sectionId: block.sectionId || null };
+      const b2 = { id: uid(), speaker: block.speaker, segments: segs2, wasMoved: block.wasMoved, wasEdited: true, sectionId: block.sectionId || null };
       const next = [...prev];
       next.splice(idx, 1, b1, b2);
       return next;
     });
   }, [pushUndo]);
 
+  /* ── Split by sentence ── */
+  const splitBySentence = useCallback((blockId) => {
+    pushUndo();
+    setBlocks(prev => {
+      const idx = prev.findIndex(b => b.id === blockId);
+      if (idx === -1) return prev;
+      const block = prev[idx];
+      const fullText = block.segments.map(s => s.text).join(" ");
+      // Find sentence boundaries
+      const sentences = [];
+      let last = 0;
+      const regex = /[.!?]+[\s"')\]]*(?=[A-Z])/g;
+      let match;
+      while ((match = regex.exec(fullText)) !== null) {
+        sentences.push(fullText.slice(last, match.index + match[0].length).trim());
+        last = match.index + match[0].length;
+      }
+      if (last < fullText.length) sentences.push(fullText.slice(last).trim());
+      if (sentences.length <= 1) return prev;
+
+      // Create new blocks for each sentence
+      const totalDur = block.segments.reduce((s, seg) => s + (seg.end - seg.start), 0);
+      const startTime = Math.min(...block.segments.map(s => s.start));
+      const newBlocks = sentences.filter(s => s.length > 0).map((sentence, i) => {
+        const charRatio = sentence.length / fullText.length;
+        const segStart = startTime + (totalDur * (sentences.slice(0, i).join("").length / fullText.length));
+        const segEnd = segStart + totalDur * charRatio;
+        return {
+          id: uid(), speaker: block.speaker, sectionId: block.sectionId || null,
+          wasMoved: block.wasMoved, wasEdited: true,
+          segments: [{ id: uid(), text: sentence, originalText: sentence, start: segStart, end: segEnd, originalIndex: 0 }],
+        };
+      });
+      const next = [...prev];
+      next.splice(idx, 1, ...newBlocks);
+      return next;
+    });
+  }, [pushUndo]);
+
+  /* ── Split at largest pause ── */
+  const splitAtPause = useCallback((blockId) => {
+    pushUndo();
+    setBlocks(prev => {
+      const idx = prev.findIndex(b => b.id === blockId);
+      if (idx === -1) return prev;
+      const block = prev[idx];
+      if (block.segments.length < 2) return prev;
+      const sorted = [...block.segments].sort((a, b) => a.start - b.start);
+      let maxGap = 0, maxGapIdx = 0;
+      for (let i = 1; i < sorted.length; i++) {
+        const gap = sorted[i].start - sorted[i - 1].end;
+        if (gap > maxGap) { maxGap = gap; maxGapIdx = i; }
+      }
+      if (maxGap <= 0) return prev;
+      const segs1 = sorted.slice(0, maxGapIdx);
+      const segs2 = sorted.slice(maxGapIdx);
+      const b1 = { id: uid(), speaker: block.speaker, segments: segs1, wasMoved: block.wasMoved, wasEdited: true, sectionId: block.sectionId || null };
+      const b2 = { id: uid(), speaker: block.speaker, segments: segs2, wasMoved: block.wasMoved, wasEdited: true, sectionId: block.sectionId || null };
+      const next = [...prev];
+      next.splice(idx, 1, b1, b2);
+      return next;
+    });
+  }, [pushUndo]);
+
+  /* ── Decompose block to individual segments ── */
+  const decomposeBlock = useCallback((blockId) => {
+    pushUndo();
+    setBlocks(prev => {
+      const idx = prev.findIndex(b => b.id === blockId);
+      if (idx === -1) return prev;
+      const block = prev[idx];
+      if (block.segments.length <= 1) return prev;
+      const newBlocks = block.segments.map(seg => ({
+        id: uid(), speaker: block.speaker, segments: [{ ...seg, id: uid() }],
+        wasMoved: block.wasMoved, wasEdited: false, sectionId: block.sectionId || null,
+      }));
+      const next = [...prev];
+      next.splice(idx, 1, ...newBlocks);
+      return next;
+    });
+  }, [pushUndo]);
+
+  /* ── Header blocks ── */
+  const addHeaderBlock = useCallback(() => {
+    pushUndo();
+    const header = {
+      id: uid(), type: "header", text: "New Section", level: 2,
+      speaker: null, sectionId: null, segments: [],
+      wasMoved: false, wasEdited: false,
+    };
+    // Insert before first selected block, or at beginning
+    const ids = blocks.map(b => b.id);
+    const firstSel = [...selected].find(id => ids.includes(id));
+    const insertIdx = firstSel ? ids.indexOf(firstSel) : 0;
+    const next = [...blocks];
+    next.splice(insertIdx, 0, header);
+    setBlocks(next);
+    setSelected(new Set([header.id]));
+    setEditingId(header.id);
+    setEditText("New Section");
+  }, [blocks, selected, pushUndo]);
+
   /* ── Inline text edit ── */
-  const startEdit = (block) => { setEditingId(block.id); setEditText(blockText(block)); };
+  const startEdit = (block) => { setEditingId(block.id); setEditText(block.type === "header" ? (block.text || "") : blockText(block)); };
 
   const commitEdit = useCallback(() => {
     if (!editingId) return;
     pushUndo();
+    // Check if editing a header block
+    const editingBlock = blocks.find(b => b.id === editingId);
+    if (editingBlock?.type === "header") {
+      setBlocks(prev => prev.map(b => b.id !== editingId ? b : { ...b, text: editText }));
+      setEditingId(null);
+      setEditText("");
+      return;
+    }
     setBlocks((prev) => prev.map((b) => {
       if (b.id !== editingId) return b;
       // Redistribute edited text across segments proportionally by duration
@@ -796,6 +1018,9 @@ export default function OralHistoryEditor() {
     const next = [...blocks];
     const [moved] = next.splice(from, 1);
     moved.wasMoved = true;
+    // Cross-section drag: adopt target block's sectionId
+    const target = next.find(b => b.id === targetId);
+    if (target) moved.sectionId = target.sectionId || null;
     next.splice(to, 0, moved);
     setBlocks(next);
     setDragging(null);
@@ -860,6 +1085,23 @@ export default function OralHistoryEditor() {
     setPlaying(null);
   };
 
+  // Audio time tracking for scrub bar
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    const onTimeUpdate = () => setCurrentTime(audio.currentTime);
+    const onLoadedMetadata = () => setAudioDuration(audio.duration || 0);
+    const onDurationChange = () => setAudioDuration(audio.duration || 0);
+    audio.addEventListener("timeupdate", onTimeUpdate);
+    audio.addEventListener("loadedmetadata", onLoadedMetadata);
+    audio.addEventListener("durationchange", onDurationChange);
+    return () => {
+      audio.removeEventListener("timeupdate", onTimeUpdate);
+      audio.removeEventListener("loadedmetadata", onLoadedMetadata);
+      audio.removeEventListener("durationchange", onDurationChange);
+    };
+  }, []);
+
   /* ── Keyboard ── */
   useEffect(() => {
     const handler = (e) => {
@@ -889,19 +1131,89 @@ export default function OralHistoryEditor() {
     return () => window.removeEventListener("keydown", handler);
   }, [editingId, doCopy, doCut, doPaste, doDelete, undo, selected, speakers, assignAndMerge, addingSpeaker, editingSpeakerId, blocks, pushUndo]);
 
+  // Trim handle drag
+  useEffect(() => {
+    if (!trimming) return;
+    const PX_PER_SEC = 20; // 20 pixels = 1 second
+    const handleMove = (e) => {
+      const deltaX = e.clientX - trimming.startX;
+      const deltaSec = deltaX / PX_PER_SEC;
+      const newTime = trimming.originalTime + deltaSec;
+      // Show tooltip with time offset
+      document.title = `${deltaSec >= 0 ? "+" : ""}${deltaSec.toFixed(1)}s → ${fmtTime(newTime)}`;
+    };
+    const handleUp = (e) => {
+      const deltaX = e.clientX - trimming.startX;
+      const deltaSec = deltaX / PX_PER_SEC;
+      if (Math.abs(deltaSec) < 0.2) { setTrimming(null); document.title = "Oral History Editor"; return; }
+
+      pushUndo();
+      setBlocks(prev => prev.map(b => {
+        if (b.id !== trimming.blockId) return b;
+        const sorted = [...b.segments].sort((a, bb) => a.start - bb.start);
+        if (trimming.edge === "start") {
+          const newStart = trimming.originalTime + deltaSec;
+          if (deltaSec > 0) {
+            // Trimming start forward: remove segments that are fully before newStart
+            const remaining = sorted.filter(s => s.end > newStart);
+            if (remaining.length === 0) return b;
+            remaining[0] = { ...remaining[0], start: Math.max(remaining[0].start, newStart) };
+            return { ...b, segments: remaining, wasEdited: true };
+          } else {
+            // Expanding start backward: extend first segment
+            const expanded = [...sorted];
+            expanded[0] = { ...expanded[0], start: newStart };
+            // Try to pull in original segments
+            const origBefore = originalSegments.filter(s => s.end > newStart && s.end <= sorted[0].start);
+            const newSegs = origBefore.map(s => ({ ...s, id: uid() }));
+            return { ...b, segments: [...newSegs, ...expanded], wasEdited: true };
+          }
+        } else {
+          const newEnd = trimming.originalTime + deltaSec;
+          if (deltaSec < 0) {
+            // Trimming end backward: remove segments fully after newEnd
+            const remaining = sorted.filter(s => s.start < newEnd);
+            if (remaining.length === 0) return b;
+            remaining[remaining.length - 1] = { ...remaining[remaining.length - 1], end: Math.min(remaining[remaining.length - 1].end, newEnd) };
+            return { ...b, segments: remaining, wasEdited: true };
+          } else {
+            // Expanding end forward: extend last segment
+            const expanded = [...sorted];
+            expanded[expanded.length - 1] = { ...expanded[expanded.length - 1], end: newEnd };
+            // Try to pull in original segments
+            const origAfter = originalSegments.filter(s => s.start >= sorted[sorted.length - 1].end && s.start < newEnd);
+            const newSegs = origAfter.map(s => ({ ...s, id: uid() }));
+            return { ...b, segments: [...expanded, ...newSegs], wasEdited: true };
+          }
+        }
+      }));
+      setTrimming(null);
+      document.title = "Oral History Editor";
+    };
+    window.addEventListener("mousemove", handleMove);
+    window.addEventListener("mouseup", handleUp);
+    return () => {
+      window.removeEventListener("mousemove", handleMove);
+      window.removeEventListener("mouseup", handleUp);
+    };
+  }, [trimming, originalSegments, pushUndo]);
+
   useEffect(() => { if (addingSpeaker && newSpkRef.current) newSpkRef.current.focus(); }, [addingSpeaker]);
   useEffect(() => { if (editingSpeakerId && editSpkRef.current) editSpkRef.current.focus(); }, [editingSpeakerId]);
+  useEffect(() => { if (addingSection && newSectionRef.current) newSectionRef.current.focus(); }, [addingSection]);
+  useEffect(() => { if (editingSectionId && editSectionRef.current) editSectionRef.current.focus(); }, [editingSectionId]);
 
   /* ── Full project state for save ── */
   const buildProjectState = useCallback(() => {
     const speakerMap = {};
     speakers.forEach((s) => { speakerMap[s.id] = s.name; });
     return {
-      version: 1,
+      version: 2,
       title: projectTitle,
       sourceFile: audioName || "source.wav",
       totalDuration: +(blocks.reduce((sum, b) => sum + b.segments.reduce((s2, seg) => s2 + (seg.end - seg.start), 0), 0)).toFixed(3),
       speakers: speakers.map((s) => ({ id: s.id, name: s.name, color: s.color })),
+      sections: sections.map((s, i) => ({ id: s.id, name: s.name, order: i + 1 })),
       blocks: blocks.map((b, i) => {
         let effId = b.speaker;
         if (!effId) { for (let j = i - 1; j >= 0; j--) { if (blocks[j].speaker) { effId = blocks[j].speaker; break; } } }
@@ -910,6 +1222,10 @@ export default function OralHistoryEditor() {
           speaker: effId ? (speakerMap[effId] || null) : null,
           speakerId: b.speaker,
           explicitSpeaker: !!b.speaker,
+          sectionId: b.sectionId || null,
+          type: b.type || "paragraph",
+          ...(b.type === "header" ? { headerText: b.text, level: b.level || 2 } : {}),
+          editHistory: b.editHistory || [],
           text: b.segments.map((s) => s.text).join(" "),
           wasEdited: b.wasEdited,
           wasMoved: b.wasMoved,
@@ -922,7 +1238,7 @@ export default function OralHistoryEditor() {
         };
       }),
     };
-  }, [blocks, speakers, audioName, projectTitle]);
+  }, [blocks, speakers, sections, audioName, projectTitle]);
 
   /* ── Cloud sync via n8n webhooks ── */
   const cloudSave = useCallback(async () => {
@@ -981,6 +1297,101 @@ export default function OralHistoryEditor() {
     }
   }, [webhookBase, driveFileId]);
 
+  /* ── AI Analysis ── */
+  const callAI = useCallback(async (systemPrompt, userContent) => {
+    if (aiProvider === "anthropic") {
+      if (!anthropicApiKey.trim()) throw new Error("Enter your Anthropic API key in Settings");
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": anthropicApiKey.trim(),
+          "anthropic-version": "2023-06-01",
+          "anthropic-dangerous-direct-browser-access": "true",
+        },
+        body: JSON.stringify({
+          model: "claude-haiku-4-5-20251001",
+          max_tokens: 4096,
+          messages: [{ role: "user", content: systemPrompt + "\n\n" + userContent }],
+        }),
+      });
+      if (!res.ok) { const err = await res.json().catch(() => ({})); throw new Error(err.error?.message || `Anthropic API error ${res.status}`); }
+      const data = await res.json();
+      const text = data.content?.[0]?.text || "";
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) throw new Error("AI response did not contain valid JSON");
+      return JSON.parse(jsonMatch[0]);
+    } else {
+      if (!openaiApiKey.trim()) throw new Error("Enter your OpenAI API key in Settings");
+      const res = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${openaiApiKey.trim()}` },
+        body: JSON.stringify({
+          model: "gpt-4o-mini",
+          messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userContent }],
+          response_format: { type: "json_object" },
+          temperature: 0.3,
+        }),
+      });
+      if (!res.ok) { const err = await res.json().catch(() => ({})); throw new Error(err.error?.message || `OpenAI API error ${res.status}`); }
+      const data = await res.json();
+      return JSON.parse(data.choices[0].message.content);
+    }
+  }, [aiProvider, anthropicApiKey, openaiApiKey]);
+
+  const analyzeTranscript = useCallback(async () => {
+    if (blocks.length === 0) return;
+    setAiAnalyzing(true);
+    setSyncStatus("saving");
+    setSyncMsg("Analyzing transcript with AI...");
+    try {
+      // Build condensed transcript
+      const condensed = blocks.map((b, i) => {
+        const spk = speakers.find(s => s.id === b.speaker)?.name || "";
+        const text = b.segments.map(s => s.text).join(" ").slice(0, 80);
+        return `[${i}] ${spk ? spk + ": " : ""}${text}...`;
+      }).join("\n");
+
+      const systemPrompt = `You are analyzing an oral history transcript to identify natural topic sections and tags. Return a JSON object with:
+- "sections": array of { "name": string, "startBlock": number, "endBlock": number } identifying natural topic/chapter boundaries
+- "tags": array of { "startBlock": number, "endBlock": number, "tags": string[] } identifying key topics discussed in block ranges
+
+Keep section names concise (3-6 words). Identify 3-10 sections. Tag with 1-3 relevant topic keywords per range.
+Return ONLY valid JSON, no other text.`;
+
+      const result = await callAI(systemPrompt, condensed);
+      setAiSuggestions(result);
+      setSyncStatus("loaded");
+      setSyncMsg("AI analysis complete — review suggestions");
+      setTimeout(() => setSyncStatus(null), 3000);
+    } catch (err) {
+      setSyncStatus("error");
+      setSyncMsg("AI analysis failed: " + err.message);
+      setTimeout(() => setSyncStatus(null), 5000);
+    } finally {
+      setAiAnalyzing(false);
+    }
+  }, [blocks, speakers, callAI]);
+
+  const applyAiSuggestions = useCallback((selectedSections) => {
+    if (!aiSuggestions?.sections) return;
+    pushUndo();
+    const newSections = [];
+    const blockUpdates = {};
+    selectedSections.forEach(idx => {
+      const suggestion = aiSuggestions.sections[idx];
+      if (!suggestion) return;
+      const secId = uid();
+      newSections.push({ id: secId, name: suggestion.name, collapsed: false });
+      for (let i = suggestion.startBlock; i <= Math.min(suggestion.endBlock, blocks.length - 1); i++) {
+        blockUpdates[blocks[i].id] = secId;
+      }
+    });
+    setSections(prev => [...prev, ...newSections]);
+    setBlocks(prev => prev.map(b => blockUpdates[b.id] ? { ...b, sectionId: blockUpdates[b.id] } : b));
+    setAiSuggestions(null);
+  }, [aiSuggestions, blocks, pushUndo]);
+
   /* ── Periodic auto-save ── */
   const AUTO_SAVE_INTERVAL = 3 * 60 * 1000; // 3 minutes
   useEffect(() => {
@@ -996,31 +1407,72 @@ export default function OralHistoryEditor() {
   }, [autoSaveEnabled, webhookBase, blocks.length, cloudSave, syncStatus]);
 
   /* ── Export: Markdown ── */
-  const generateMarkdown = useCallback(() => {
+  const generateMarkdown = useCallback((sectionFilter) => {
     let md = `# ${projectTitle}\n\n`;
     if (audioName) md += `*Source: ${audioName}*\n\n---\n\n`;
-    let lastSpeakerName = null;
-    blocks.forEach((block, idx) => {
-      const spk = getEffectiveSpeaker(idx);
-      const name = spk ? spk.name : "Unknown Speaker";
-      const text = blockText(block);
-      if (name !== lastSpeakerName) {
-        md += `**${name}:** ${text}\n\n`;
-      } else {
-        md += `${text}\n\n`;
-      }
-      lastSpeakerName = name;
-    });
-    return md;
-  }, [blocks, getEffectiveSpeaker, blockText, audioName, projectTitle]);
 
-  const downloadMarkdown = useCallback(() => {
-    const blob = new Blob([generateMarkdown()], { type: "text/markdown" });
+    const renderBlocks = (blockList, blockIndices) => {
+      let out = "";
+      let lastSpeakerName = null;
+      blockList.forEach((block, i) => {
+        if (block.type === "header") {
+          const prefix = "#".repeat(block.level || 2);
+          md += `${prefix} ${block.text || "Untitled"}\n\n`;
+          return;
+        }
+        const idx = blockIndices ? blockIndices[i] : blocks.indexOf(block);
+        const spk = getEffectiveSpeaker(idx);
+        const name = spk ? spk.name : "Unknown Speaker";
+        const text = blockText(block);
+        if (name !== lastSpeakerName) {
+          out += `**${name}:** ${text}\n\n`;
+        } else {
+          out += `${text}\n\n`;
+        }
+        lastSpeakerName = name;
+      });
+      return out;
+    };
+
+    if (sections.length === 0 || sectionFilter) {
+      // Flat or single-section export
+      const filteredBlocks = sectionFilter
+        ? blocks.filter(b => b.sectionId === sectionFilter)
+        : blocks;
+      const filteredIndices = sectionFilter
+        ? blocks.map((b, i) => b.sectionId === sectionFilter ? i : -1).filter(i => i !== -1)
+        : null;
+      md += renderBlocks(filteredBlocks, filteredIndices);
+    } else {
+      // Section-grouped export
+      const unsectioned = blocks.filter(b => !b.sectionId);
+      if (unsectioned.length > 0) {
+        md += renderBlocks(unsectioned, unsectioned.map(b => blocks.indexOf(b)));
+        md += "---\n\n";
+      }
+      sections.forEach(section => {
+        const sBlocks = blocks.filter(b => b.sectionId === section.id);
+        if (sBlocks.length > 0) {
+          md += `## ${section.name}\n\n`;
+          md += renderBlocks(sBlocks, sBlocks.map(b => blocks.indexOf(b)));
+        }
+      });
+    }
+    return md;
+  }, [blocks, sections, getEffectiveSpeaker, blockText, audioName, projectTitle]);
+
+  const downloadMarkdown = useCallback((sectionFilter) => {
+    const md = generateMarkdown(sectionFilter);
+    const blob = new Blob([md], { type: "text/markdown" });
     const url = URL.createObjectURL(blob);
-    const fn = projectTitle.replace(/[^a-zA-Z0-9_ -]/g, "").replace(/\s+/g, "-").toLowerCase() || "oral-history";
+    let fn = projectTitle.replace(/[^a-zA-Z0-9_ -]/g, "").replace(/\s+/g, "-").toLowerCase() || "oral-history";
+    if (sectionFilter) {
+      const sec = sections.find(s => s.id === sectionFilter);
+      if (sec) fn += "-" + sec.name.replace(/[^a-zA-Z0-9_ -]/g, "").replace(/\s+/g, "-").toLowerCase();
+    }
     const a = document.createElement("a"); a.href = url; a.download = `${fn}.md`; a.click();
     URL.revokeObjectURL(url);
-  }, [generateMarkdown, projectTitle]);
+  }, [generateMarkdown, projectTitle, sections]);
 
   /* ── Export: Project JSON ── */
   const generateProject = useCallback(() => {
@@ -1147,6 +1599,19 @@ export default function OralHistoryEditor() {
               style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, padding: "4px 8px", background: C.surface, border: `1px solid ${C.border}`, borderRadius: 4, color: C.text, width: 260 }} />
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+            <label style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim }}>Anthropic API Key</label>
+            <input value={anthropicApiKey} onChange={(e) => setAnthropicApiKey(e.target.value)}
+              type="password" placeholder="sk-ant-..."
+              style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, padding: "4px 8px", background: C.surface, border: `1px solid ${C.border}`, borderRadius: 4, color: C.text, width: 260 }} />
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+            <label style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim }}>AI Provider</label>
+            <div style={{ display: "flex", gap: 4 }}>
+              <SmBtn onClick={() => setAiProvider("anthropic")} accent={aiProvider === "anthropic"}>Anthropic</SmBtn>
+              <SmBtn onClick={() => setAiProvider("openai")} accent={aiProvider === "openai"}>OpenAI</SmBtn>
+            </div>
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
             <label style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim }}>Google Drive File ID</label>
             <div style={{ display: "flex", gap: 6 }}>
               <input value={driveFileId} onChange={(e) => setDriveFileId(e.target.value)}
@@ -1173,6 +1638,7 @@ export default function OralHistoryEditor() {
           <Sep />
           <TBtn onClick={doDelete} disabled={!selected.size} label="Delete" />
           <TBtn onClick={mergeSelected} disabled={selected.size < 2} label="Merge" />
+          <TBtn onClick={addHeaderBlock} disabled={!hasContent} label="+ Header" />
           <Sep />
           <TBtn onClick={undo} disabled={!undoStack.length} label="Undo" k="⌘Z" />
           <Sep />
@@ -1180,6 +1646,8 @@ export default function OralHistoryEditor() {
           <TBtn onClick={stopPlayback} label="■ Stop" />
           <Sep />
           <TBtn onClick={() => setShowSpeakers(!showSpeakers)} label={showSpeakers ? "◂ Speakers" : "▸ Speakers"} />
+          <TBtn onClick={() => setShowTOC(!showTOC)} label={showTOC ? "◂ Sections" : "▸ Sections"} />
+          <TBtn onClick={() => setShowSource(!showSource)} label={showSource ? "◂ Source" : "▸ Source"} />
           <div style={{ flex: 1 }} />
           <span style={{ color: C.textDim, fontSize: 10 }}>
             {blocks.length} ¶ · {fmtTime(totalDuration)}
@@ -1191,92 +1659,237 @@ export default function OralHistoryEditor() {
 
       <div style={{ flex: 1, display: "flex", overflow: "hidden" }}>
 
-        {/* ── Speaker Panel ── */}
-        {hasContent && showSpeakers && (
+        {/* ── Left Sidebar: Sections + Speakers ── */}
+        {hasContent && (showSpeakers || showTOC) && (
           <div style={{
             width: 210, borderRight: `1px solid ${C.border}`, background: C.surface,
             display: "flex", flexDirection: "column", flexShrink: 0,
           }}>
-            <div style={{ padding: "14px 16px", borderBottom: `1px solid ${C.border}`, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-              <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim, letterSpacing: "0.06em", textTransform: "uppercase" }}>Speakers</span>
-              <button onClick={() => setAddingSpeaker(true)} style={{ fontFamily: "'DM Mono', monospace", fontSize: 15, background: "none", border: "none", color: C.accent, cursor: "pointer", padding: "0 4px", lineHeight: 1 }}>+</button>
-            </div>
-
-            <div style={{ flex: 1, overflowY: "auto", padding: "6px 0" }}>
-              {speakers.map((spk, idx) => {
-                const count = blocks.filter((_, i) => getEffectiveSpeakerId(i) === spk.id).length;
-                const isEd = editingSpeakerId === spk.id;
-                return (
-                  <div key={spk.id}
-                    onClick={() => { if (selected.size > 0 && !isEd) assignAndMerge(spk.id); else if (selected.size === 0 && !isEd) { setEditingSpeakerId(spk.id); setEditingSpeakerName(spk.name); } }}
-                    style={{
-                      padding: "5px 16px", display: "flex", alignItems: "center", gap: 7,
-                      cursor: selected.size > 0 ? "pointer" : "default",
-                      borderLeft: `3px solid ${spk.color}`,
-                      background: "transparent", transition: "background 0.1s",
-                    }}
-                    onMouseEnter={(e) => { if (selected.size > 0) e.currentTarget.style.background = C.raised; }}
-                    onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}
-                  >
-                    {isEd ? (
-                      <input ref={editSpkRef} value={editingSpeakerName}
-                        onChange={(e) => setEditingSpeakerName(e.target.value)}
-                        onKeyDown={(e) => { if (e.key === "Enter") renameSpeaker(spk.id, editingSpeakerName); if (e.key === "Escape") setEditingSpeakerId(null); }}
-                        onBlur={() => editingSpeakerName.trim() ? renameSpeaker(spk.id, editingSpeakerName) : setEditingSpeakerId(null)}
-                        style={{ flex: 1, background: C.raised, border: `1px solid ${spk.color}`, borderRadius: 3, color: C.text, fontFamily: "'DM Mono', monospace", fontSize: 12, padding: "2px 6px", minWidth: 0 }}
-                      />
-                    ) : (
-                      <span onDoubleClick={(e) => { e.stopPropagation(); setEditingSpeakerId(spk.id); setEditingSpeakerName(spk.name); }}
-                        style={{ flex: 1, fontFamily: "'DM Mono', monospace", fontSize: 12, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                        {spk.name}
-                      </span>
-                    )}
-                    <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: C.border, minWidth: 12, textAlign: "center" }}>{idx < 9 ? idx + 1 : ""}</span>
-                    <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: C.textDim, minWidth: 14, textAlign: "right" }}>{count}</span>
-                    {!isEd && (
-                      <button onClick={(e) => { e.stopPropagation(); removeSpeaker(spk.id); }}
-                        style={{ background: "none", border: "none", color: C.border, cursor: "pointer", fontSize: 12, padding: 0, lineHeight: 1, opacity: 0.4 }}
-                        onMouseEnter={(e) => { e.currentTarget.style.opacity = "1"; e.currentTarget.style.color = C.danger; }}
-                        onMouseLeave={(e) => { e.currentTarget.style.opacity = "0.4"; e.currentTarget.style.color = C.border; }}
-                      >×</button>
-                    )}
+            {/* ── Sections / TOC Panel ── */}
+            {showTOC && (
+              <div style={{ display: "flex", flexDirection: "column", borderBottom: showSpeakers ? `1px solid ${C.border}` : "none", maxHeight: showSpeakers ? "50%" : "100%", overflow: "hidden" }}>
+                <div style={{ padding: "14px 16px", borderBottom: `1px solid ${C.border}`, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim, letterSpacing: "0.06em", textTransform: "uppercase" }}>Sections</span>
+                  <div style={{ display: "flex", gap: 2, alignItems: "center" }}>
+                    <button onClick={analyzeTranscript} disabled={aiAnalyzing || blocks.length === 0}
+                      style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, background: "none", border: "none", color: aiAnalyzing ? C.textDim : C.accent, cursor: aiAnalyzing ? "default" : "pointer", padding: "0 4px", lineHeight: 1 }}
+                      title="AI auto-section">
+                      {aiAnalyzing ? "…" : "AI"}
+                    </button>
+                    <button onClick={() => setAddingSection(true)} style={{ fontFamily: "'DM Mono', monospace", fontSize: 15, background: "none", border: "none", color: C.accent, cursor: "pointer", padding: "0 4px", lineHeight: 1 }}>+</button>
                   </div>
-                );
-              })}
-
-              {addingSpeaker && (
-                <div style={{ padding: "5px 16px", display: "flex", alignItems: "center", gap: 7, borderLeft: `3px solid ${SPEAKER_PALETTE[speakers.length % SPEAKER_PALETTE.length].color}` }}>
-                  <input ref={newSpkRef} value={newSpeakerName} onChange={(e) => setNewSpeakerName(e.target.value)}
-                    onKeyDown={(e) => { if (e.key === "Enter") addSpeaker(newSpeakerName); if (e.key === "Escape") { setAddingSpeaker(false); setNewSpeakerName(""); } }}
-                    onBlur={() => newSpeakerName.trim() ? addSpeaker(newSpeakerName) : (setAddingSpeaker(false), setNewSpeakerName(""))}
-                    placeholder="Name..." style={{ flex: 1, background: C.raised, border: `1px solid ${SPEAKER_PALETTE[speakers.length % SPEAKER_PALETTE.length].color}`, borderRadius: 3, color: C.text, fontFamily: "'DM Mono', monospace", fontSize: 12, padding: "2px 6px", minWidth: 0 }}
-                  />
                 </div>
-              )}
+                <div style={{ flex: 1, overflowY: "auto", padding: "6px 0" }}>
+                  {/* Unsectioned count */}
+                  {sectionedBlocks.unsectioned.length > 0 && (
+                    <div
+                      onClick={() => { if (selected.size > 0) unsectionBlocks(); }}
+                      style={{
+                        padding: "5px 16px", display: "flex", alignItems: "center", gap: 7,
+                        cursor: selected.size > 0 ? "pointer" : "default",
+                        borderLeft: "3px solid transparent",
+                        background: "transparent", transition: "background 0.1s",
+                      }}
+                      onMouseEnter={(e) => { if (selected.size > 0) e.currentTarget.style.background = C.raised; }}
+                      onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}
+                    >
+                      <span style={{ flex: 1, fontFamily: "'DM Mono', monospace", fontSize: 11, color: C.textDim, fontStyle: "italic" }}>Unsectioned</span>
+                      <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: C.textDim }}>{sectionedBlocks.unsectioned.length}</span>
+                    </div>
+                  )}
 
-              {speakers.length === 0 && !addingSpeaker && (
-                <div style={{ padding: "24px 16px", textAlign: "center" }}>
-                  <p style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim, lineHeight: 1.6 }}>Add speakers to tag<br />each paragraph</p>
-                  <button onClick={() => setAddingSpeaker(true)}
-                    style={{ marginTop: 8, fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "4px 10px", background: C.accentDim, border: `1px solid ${C.accent}`, borderRadius: 4, color: C.accent, cursor: "pointer" }}>
-                    + Add speaker
-                  </button>
+                  {sectionedBlocks.sections.map((section) => {
+                    const isEd = editingSectionId === section.id;
+                    return (
+                      <div key={section.id}
+                        onClick={() => {
+                          if (selected.size > 0 && !isEd) {
+                            assignToSection(section.id);
+                          } else if (!isEd) {
+                            document.getElementById('section-' + section.id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                          }
+                        }}
+                        style={{
+                          padding: "5px 16px", display: "flex", alignItems: "center", gap: 7,
+                          cursor: "pointer",
+                          borderLeft: `3px solid ${C.accent}`,
+                          background: activeSectionId === section.id ? C.accentDim : "transparent",
+                          transition: "background 0.1s",
+                        }}
+                        onMouseEnter={(e) => { e.currentTarget.style.background = C.raised; }}
+                        onMouseLeave={(e) => { e.currentTarget.style.background = activeSectionId === section.id ? C.accentDim : "transparent"; }}
+                      >
+                        <button onClick={(e) => { e.stopPropagation(); toggleSectionCollapse(section.id); }}
+                          style={{ background: "none", border: "none", color: C.textDim, cursor: "pointer", fontSize: 10, padding: 0, lineHeight: 1 }}>
+                          {section.collapsed ? "▸" : "▾"}
+                        </button>
+                        {isEd ? (
+                          <input ref={editSectionRef} value={editingSectionName}
+                            onChange={(e) => setEditingSectionName(e.target.value)}
+                            onKeyDown={(e) => { if (e.key === "Enter") renameSection(section.id, editingSectionName); if (e.key === "Escape") setEditingSectionId(null); }}
+                            onBlur={() => editingSectionName.trim() ? renameSection(section.id, editingSectionName) : setEditingSectionId(null)}
+                            onClick={(e) => e.stopPropagation()}
+                            style={{ flex: 1, background: C.raised, border: `1px solid ${C.accent}`, borderRadius: 3, color: C.text, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "2px 6px", minWidth: 0 }}
+                          />
+                        ) : (
+                          <span onDoubleClick={(e) => { e.stopPropagation(); setEditingSectionId(section.id); setEditingSectionName(section.name); }}
+                            style={{ flex: 1, fontFamily: "'DM Mono', monospace", fontSize: 11, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                            {section.name}
+                          </span>
+                        )}
+                        <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: C.textDim, minWidth: 14, textAlign: "right" }}>{section.blocks.length}</span>
+                        {!isEd && (
+                          <button onClick={(e) => { e.stopPropagation(); removeSection(section.id); }}
+                            style={{ background: "none", border: "none", color: C.border, cursor: "pointer", fontSize: 12, padding: 0, lineHeight: 1, opacity: 0.4 }}
+                            onMouseEnter={(e) => { e.currentTarget.style.opacity = "1"; e.currentTarget.style.color = C.danger; }}
+                            onMouseLeave={(e) => { e.currentTarget.style.opacity = "0.4"; e.currentTarget.style.color = C.border; }}
+                          >×</button>
+                        )}
+                      </div>
+                    );
+                  })}
+
+                  {addingSection && (
+                    <div style={{ padding: "5px 16px", display: "flex", alignItems: "center", gap: 7, borderLeft: `3px solid ${C.accent}` }}>
+                      <input ref={newSectionRef} value={newSectionName} onChange={(e) => setNewSectionName(e.target.value)}
+                        onKeyDown={(e) => { if (e.key === "Enter") addSection(newSectionName); if (e.key === "Escape") { setAddingSection(false); setNewSectionName(""); } }}
+                        onBlur={() => newSectionName.trim() ? addSection(newSectionName) : (setAddingSection(false), setNewSectionName(""))}
+                        placeholder="Section name..." style={{ flex: 1, background: C.raised, border: `1px solid ${C.accent}`, borderRadius: 3, color: C.text, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "2px 6px", minWidth: 0 }}
+                      />
+                    </div>
+                  )}
+
+                  {sections.length === 0 && !addingSection && (
+                    <div style={{ padding: "16px 16px", textAlign: "center" }}>
+                      <p style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim, lineHeight: 1.6 }}>Organize paragraphs<br />into sections</p>
+                      <button onClick={() => setAddingSection(true)}
+                        style={{ marginTop: 8, fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "4px 10px", background: C.accentDim, border: `1px solid ${C.accent}`, borderRadius: 4, color: C.accent, cursor: "pointer" }}>
+                        + Add section
+                      </button>
+                    </div>
+                  )}
                 </div>
-              )}
-            </div>
 
-            {selected.size > 0 && speakers.length > 0 && (
-              <div style={{ padding: "8px 16px", borderTop: `1px solid ${C.border}`, background: C.raised }}>
-                <p style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.accent, lineHeight: 1.4 }}>
-                  {selected.size} selected — press 1–{Math.min(speakers.length, 9)} or click
-                </p>
+                {selected.size > 0 && sections.length > 0 && (
+                  <div style={{ padding: "6px 16px", borderTop: `1px solid ${C.border}`, background: C.raised }}>
+                    <p style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.accent, lineHeight: 1.4 }}>
+                      {selected.size} selected — click section to assign
+                    </p>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* ── Speaker Panel ── */}
+            {showSpeakers && (
+              <div style={{ display: "flex", flexDirection: "column", flex: 1, overflow: "hidden" }}>
+                <div style={{ padding: "14px 16px", borderBottom: `1px solid ${C.border}`, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim, letterSpacing: "0.06em", textTransform: "uppercase" }}>Speakers</span>
+                  <button onClick={() => setAddingSpeaker(true)} style={{ fontFamily: "'DM Mono', monospace", fontSize: 15, background: "none", border: "none", color: C.accent, cursor: "pointer", padding: "0 4px", lineHeight: 1 }}>+</button>
+                </div>
+
+                <div style={{ flex: 1, overflowY: "auto", padding: "6px 0" }}>
+                  {speakers.map((spk, idx) => {
+                    const count = blocks.filter((_, i) => getEffectiveSpeakerId(i) === spk.id).length;
+                    const isEd = editingSpeakerId === spk.id;
+                    return (
+                      <div key={spk.id}
+                        onClick={() => { if (selected.size > 0 && !isEd) assignAndMerge(spk.id); else if (selected.size === 0 && !isEd) { setEditingSpeakerId(spk.id); setEditingSpeakerName(spk.name); } }}
+                        style={{
+                          padding: "5px 16px", display: "flex", alignItems: "center", gap: 7,
+                          cursor: selected.size > 0 ? "pointer" : "default",
+                          borderLeft: `3px solid ${spk.color}`,
+                          background: "transparent", transition: "background 0.1s",
+                        }}
+                        onMouseEnter={(e) => { if (selected.size > 0) e.currentTarget.style.background = C.raised; }}
+                        onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}
+                      >
+                        {isEd ? (
+                          <input ref={editSpkRef} value={editingSpeakerName}
+                            onChange={(e) => setEditingSpeakerName(e.target.value)}
+                            onKeyDown={(e) => { if (e.key === "Enter") renameSpeaker(spk.id, editingSpeakerName); if (e.key === "Escape") setEditingSpeakerId(null); }}
+                            onBlur={() => editingSpeakerName.trim() ? renameSpeaker(spk.id, editingSpeakerName) : setEditingSpeakerId(null)}
+                            style={{ flex: 1, background: C.raised, border: `1px solid ${spk.color}`, borderRadius: 3, color: C.text, fontFamily: "'DM Mono', monospace", fontSize: 12, padding: "2px 6px", minWidth: 0 }}
+                          />
+                        ) : (
+                          <span onDoubleClick={(e) => { e.stopPropagation(); setEditingSpeakerId(spk.id); setEditingSpeakerName(spk.name); }}
+                            style={{ flex: 1, fontFamily: "'DM Mono', monospace", fontSize: 12, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                            {spk.name}
+                          </span>
+                        )}
+                        <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: C.border, minWidth: 12, textAlign: "center" }}>{idx < 9 ? idx + 1 : ""}</span>
+                        <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: C.textDim, minWidth: 14, textAlign: "right" }}>{count}</span>
+                        {!isEd && (
+                          <button onClick={(e) => { e.stopPropagation(); removeSpeaker(spk.id); }}
+                            style={{ background: "none", border: "none", color: C.border, cursor: "pointer", fontSize: 12, padding: 0, lineHeight: 1, opacity: 0.4 }}
+                            onMouseEnter={(e) => { e.currentTarget.style.opacity = "1"; e.currentTarget.style.color = C.danger; }}
+                            onMouseLeave={(e) => { e.currentTarget.style.opacity = "0.4"; e.currentTarget.style.color = C.border; }}
+                          >×</button>
+                        )}
+                      </div>
+                    );
+                  })}
+
+                  {addingSpeaker && (
+                    <div style={{ padding: "5px 16px", display: "flex", alignItems: "center", gap: 7, borderLeft: `3px solid ${SPEAKER_PALETTE[speakers.length % SPEAKER_PALETTE.length].color}` }}>
+                      <input ref={newSpkRef} value={newSpeakerName} onChange={(e) => setNewSpeakerName(e.target.value)}
+                        onKeyDown={(e) => { if (e.key === "Enter") addSpeaker(newSpeakerName); if (e.key === "Escape") { setAddingSpeaker(false); setNewSpeakerName(""); } }}
+                        onBlur={() => newSpeakerName.trim() ? addSpeaker(newSpeakerName) : (setAddingSpeaker(false), setNewSpeakerName(""))}
+                        placeholder="Name..." style={{ flex: 1, background: C.raised, border: `1px solid ${SPEAKER_PALETTE[speakers.length % SPEAKER_PALETTE.length].color}`, borderRadius: 3, color: C.text, fontFamily: "'DM Mono', monospace", fontSize: 12, padding: "2px 6px", minWidth: 0 }}
+                      />
+                    </div>
+                  )}
+
+                  {speakers.length === 0 && !addingSpeaker && (
+                    <div style={{ padding: "24px 16px", textAlign: "center" }}>
+                      <p style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim, lineHeight: 1.6 }}>Add speakers to tag<br />each paragraph</p>
+                      <button onClick={() => setAddingSpeaker(true)}
+                        style={{ marginTop: 8, fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "4px 10px", background: C.accentDim, border: `1px solid ${C.accent}`, borderRadius: 4, color: C.accent, cursor: "pointer" }}>
+                        + Add speaker
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                {selected.size > 0 && speakers.length > 0 && (
+                  <div style={{ padding: "8px 16px", borderTop: `1px solid ${C.border}`, background: C.raised }}>
+                    <p style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.accent, lineHeight: 1.4 }}>
+                      {selected.size} selected — press 1–{Math.min(speakers.length, 9)} or click
+                    </p>
+                  </div>
+                )}
               </div>
             )}
           </div>
         )}
 
         {/* ── Main Content: Paragraph View ── */}
-        <div style={{ flex: 1, overflowY: "auto", padding: "32px 48px 100px", maxWidth: 800, margin: "0 auto", width: "100%" }}>
+        <div ref={editorContentRef} style={{ flex: 1, overflowY: "auto", padding: "32px 48px 100px", maxWidth: 800, margin: "0 auto", width: "100%" }}
+          onDragOver={(e) => {
+            if (e.dataTransfer.types.includes("application/json")) {
+              e.preventDefault();
+              e.dataTransfer.dropEffect = "copy";
+            }
+          }}
+          onDrop={(e) => {
+            try {
+              const chunkData = JSON.parse(e.dataTransfer.getData("application/json"));
+              if (chunkData?.segments) {
+                pushUndo();
+                const newBlock = {
+                  id: uid(), speaker: null, sectionId: null,
+                  wasMoved: false, wasEdited: false,
+                  segments: chunkData.segments.map(s => ({
+                    id: uid(), text: s.text, originalText: s.originalText || s.text,
+                    start: s.start, end: s.end, originalIndex: s.originalIndex || 0,
+                  })),
+                };
+                setBlocks(prev => [...prev, newBlock]);
+                setSelected(new Set([newBlock.id]));
+              }
+            } catch (err) { /* ignore invalid drops */ }
+          }}
+        >
           {!hasContent && (
             <div style={{ textAlign: "center", padding: "80px 20px" }}>
               <p style={{ fontFamily: "'Instrument Serif', serif", fontSize: 32, color: C.text, marginBottom: 12 }}>Begin an oral history</p>
@@ -1295,103 +1908,315 @@ export default function OralHistoryEditor() {
             </div>
           )}
 
-          {blocks.map((block, idx) => {
-            const isSelected = selected.has(block.id);
-            const isEditing = editingId === block.id;
-            const isPlaying = playing === block.id;
-            const isDragTarget = dragOver === block.id && dragging !== block.id;
-            const spk = getEffectiveSpeaker(idx);
-            const isInherited = !block.speaker && spk;
-            const text = blockText(block);
-            const duration = blockDuration(block);
+          {/* ── Section-grouped block rendering ── */}
+          {hasContent && (() => {
+            const renderBlock = (block, idx) => {
+              const isSelected = selected.has(block.id);
+              const isEditing = editingId === block.id;
+              const isPlaying = playing === block.id;
+              const isDragTarget = dragOver === block.id && dragging !== block.id;
+              const spk = getEffectiveSpeaker(idx);
+              const isInherited = !block.speaker && spk;
+              const text = blockText(block);
 
-            return (
-              <div
-                key={block.id}
-                onClick={(e) => handleSelect(block.id, e)}
-                draggable={!isEditing}
-                onDragStart={() => setDragging(block.id)}
-                onDragOver={(e) => { e.preventDefault(); setDragOver(block.id); }}
-                onDrop={() => handleDrop(block.id)}
-                onDragEnd={() => { setDragging(null); setDragOver(null); }}
-                style={{
-                  marginBottom: spk ? 16 : 4,
-                  padding: "10px 20px",
-                  borderRadius: 6,
-                  background: isSelected ? C.selected : "transparent",
-                  border: `1px solid ${isDragTarget ? C.accent : isSelected ? C.selectedBorder : "transparent"}`,
-                  borderLeft: `3px solid ${spk ? spk.color : "transparent"}`,
-                  cursor: "pointer",
-                  transition: "all 0.12s ease",
-                  animation: "fadeIn 0.2s ease",
-                  position: "relative",
-                }}
-              >
-                {/* Speaker name + timestamp */}
-                <div style={{ display: "flex", alignItems: "baseline", gap: 12, marginBottom: 6 }}>
-                  {spk ? (
-                    <span style={{
-                      fontFamily: "'DM Mono', monospace", fontSize: 12, fontWeight: 500,
-                      color: spk.color, letterSpacing: "0.02em",
-                      opacity: isInherited ? 0.45 : 1,
-                    }}>
-                      {spk.name}{isInherited ? " (cont.)" : ""}
+              // Header block rendering
+              if (block.type === "header") {
+                const hSize = { 1: 28, 2: 22, 3: 18 }[block.level || 2] || 22;
+                return (
+                  <div
+                    key={block.id}
+                    onClick={(e) => handleSelect(block.id, e)}
+                    draggable={!isEditing}
+                    onDragStart={() => setDragging(block.id)}
+                    onDragOver={(e) => { e.preventDefault(); setDragOver(block.id); }}
+                    onDrop={() => handleDrop(block.id)}
+                    onDragEnd={() => { setDragging(null); setDragOver(null); }}
+                    style={{
+                      marginBottom: 8, padding: "8px 20px", borderRadius: 6,
+                      background: isSelected ? C.selected : "transparent",
+                      border: `1px solid ${isDragTarget ? C.accent : isSelected ? C.selectedBorder : "transparent"}`,
+                      cursor: "pointer", transition: "all 0.12s ease",
+                    }}
+                  >
+                    {isEditing ? (
+                      <div>
+                        <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+                          {[1, 2, 3].map(lvl => (
+                            <SmBtn key={lvl} onClick={(e) => { e.stopPropagation(); setBlocks(prev => prev.map(b => b.id === block.id ? { ...b, level: lvl } : b)); }}
+                              accent={block.level === lvl}>H{lvl}</SmBtn>
+                          ))}
+                        </div>
+                        <input autoFocus value={editText} onChange={(e) => setEditText(e.target.value)}
+                          onKeyDown={(e) => { if (e.key === "Enter") commitEdit(); if (e.key === "Escape") cancelEdit(); }}
+                          style={{
+                            width: "100%", background: C.surface, border: `1px solid ${C.accent}`, borderRadius: 4,
+                            color: C.text, fontFamily: "'Instrument Serif', serif", fontSize: hSize, fontWeight: 400,
+                            padding: "8px 12px",
+                          }}
+                        />
+                        <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                          <SmBtn onClick={commitEdit} accent>Save</SmBtn>
+                          <SmBtn onClick={cancelEdit}>Cancel</SmBtn>
+                        </div>
+                      </div>
+                    ) : (
+                      <h2 style={{ fontFamily: "'Instrument Serif', serif", fontSize: hSize, fontWeight: 400, color: C.text, margin: 0 }}>
+                        {block.text || "Untitled"}
+                      </h2>
+                    )}
+                    {!isEditing && isSelected && (
+                      <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
+                        <SmBtn onClick={(e) => { e.stopPropagation(); startEdit(block); }}>✎ Edit</SmBtn>
+                        {[1, 2, 3].map(lvl => (
+                          <SmBtn key={lvl} onClick={(e) => { e.stopPropagation(); setBlocks(prev => prev.map(b => b.id === block.id ? { ...b, level: lvl } : b)); }}
+                            accent={block.level === lvl}>H{lvl}</SmBtn>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              }
+
+              return (
+                <div
+                  key={block.id}
+                  onClick={(e) => handleSelect(block.id, e)}
+                  draggable={!isEditing}
+                  onDragStart={() => setDragging(block.id)}
+                  onDragOver={(e) => { e.preventDefault(); setDragOver(block.id); }}
+                  onDrop={() => handleDrop(block.id)}
+                  onDragEnd={() => { setDragging(null); setDragOver(null); }}
+                  style={{
+                    marginBottom: spk ? 16 : 4,
+                    padding: "10px 20px",
+                    borderRadius: 6,
+                    background: isSelected ? C.selected : "transparent",
+                    border: `1px solid ${isDragTarget ? C.accent : isSelected ? C.selectedBorder : "transparent"}`,
+                    borderLeft: `3px solid ${spk ? spk.color : "transparent"}`,
+                    cursor: "pointer",
+                    transition: "all 0.12s ease",
+                    animation: "fadeIn 0.2s ease",
+                    position: "relative",
+                  }}
+                >
+                  {/* Speaker name + timestamp */}
+                  <div style={{ display: "flex", alignItems: "baseline", gap: 12, marginBottom: 6 }}>
+                    {spk ? (
+                      <span style={{
+                        fontFamily: "'DM Mono', monospace", fontSize: 12, fontWeight: 500,
+                        color: spk.color, letterSpacing: "0.02em",
+                        opacity: isInherited ? 0.45 : 1,
+                      }}>
+                        {spk.name}{isInherited ? " (cont.)" : ""}
+                      </span>
+                    ) : null}
+                    <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim }}>
+                      {fmtTime(blockStart(block))} — {fmtTime(blockEnd(block))}
                     </span>
-                  ) : null}
-                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim }}>
-                    {fmtTime(blockStart(block))} — {fmtTime(blockEnd(block))}
-                  </span>
-                  {isPlaying && <span style={{ color: C.accent, animation: "pulse 1s infinite", fontSize: 12 }}>▶</span>}
-                  {(block.wasEdited || block.wasMoved) && (
-                    <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: C.textDim, opacity: 0.6 }}>
-                      {[block.wasEdited && "edited", block.wasMoved && "moved"].filter(Boolean).join(" · ")}
-                    </span>
+                    {isPlaying && <span style={{ color: C.accent, animation: "pulse 1s infinite", fontSize: 12 }}>▶</span>}
+                    {(block.wasEdited || block.wasMoved) && (
+                      <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: C.textDim, opacity: 0.6 }}>
+                        {[block.wasEdited && "edited", block.wasMoved && "moved"].filter(Boolean).join(" · ")}
+                      </span>
+                    )}
+                  </div>
+
+                  {/* Paragraph text */}
+                  {isEditing ? (
+                    <div>
+                      <textarea
+                        autoFocus value={editText} onChange={(e) => { setEditText(e.target.value); e.target.style.height = "auto"; e.target.style.height = e.target.scrollHeight + "px"; }}
+                        onKeyDown={(e) => { if (e.key === "Escape") cancelEdit(); }}
+                        ref={(el) => { if (el) { el.style.height = "auto"; el.style.height = el.scrollHeight + "px"; } }}
+                        style={{
+                          width: "100%", background: C.surface, border: `1px solid ${C.accent}`, borderRadius: 4,
+                          color: C.text, fontFamily: "'Newsreader', Georgia, serif", fontSize: 17, lineHeight: 1.75,
+                          padding: "12px 14px", resize: "vertical", minHeight: Math.min(Math.max(200, text.length / 2), 500),
+                          maxHeight: "60vh", overflow: "auto",
+                        }}
+                      />
+                      <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
+                        <SmBtn onClick={commitEdit} accent>Save</SmBtn>
+                        <SmBtn onClick={() => {
+                          const ta = document.querySelector("textarea:focus");
+                          if (ta && ta.selectionStart > 0 && ta.selectionStart < editText.length) {
+                            cancelEdit();
+                            splitBlock(block.id, ta.selectionStart);
+                          }
+                        }}>Split at cursor</SmBtn>
+                        <SmBtn onClick={cancelEdit}>Cancel</SmBtn>
+                      </div>
+                    </div>
+                  ) : (
+                    <p style={{ fontSize: 17, lineHeight: 1.75, margin: 0, color: C.text }}>
+                      {block.segments.map((seg, si) => (
+                        <span key={seg.id || si}
+                          onClick={(e) => {
+                            if (audioUrl && audioRef.current) {
+                              e.stopPropagation();
+                              audioRef.current.currentTime = seg.start;
+                              audioRef.current.play();
+                              setPlaying(block.id);
+                              setPlayingSegId(seg.id);
+                            }
+                          }}
+                          style={{
+                            cursor: audioUrl ? "pointer" : "default",
+                            background: playingSegId === seg.id ? C.accentDim : "transparent",
+                            borderRadius: 2, padding: "0 1px",
+                            transition: "background 0.15s",
+                          }}
+                          title={audioUrl ? `${fmtTime(seg.start)} — ${fmtTime(seg.end)}` : undefined}
+                        >
+                          {seg.text}{si < block.segments.length - 1 ? " " : ""}
+                        </span>
+                      ))}
+                    </p>
+                  )}
+
+                  {/* Hover actions */}
+                  {!isEditing && isSelected && (
+                    <div style={{ display: "flex", gap: 6, marginTop: 8, flexWrap: "wrap" }}>
+                      {audioUrl && <SmBtn onClick={(e) => { e.stopPropagation(); playBlock(block); }}>▶ Play</SmBtn>}
+                      <SmBtn onClick={(e) => { e.stopPropagation(); startEdit(block); }}>✎ Edit</SmBtn>
+                      <SmBtn onClick={(e) => { e.stopPropagation(); pushUndo(); splitBlock(block.id, Math.floor(text.length / 2)); }}>Split ½</SmBtn>
+                      <SmBtn onClick={(e) => { e.stopPropagation(); splitBySentence(block.id); }}>Split sentences</SmBtn>
+                      {block.segments.length > 1 && <SmBtn onClick={(e) => { e.stopPropagation(); splitAtPause(block.id); }}>Split at pause</SmBtn>}
+                      {block.segments.length > 1 && <SmBtn onClick={(e) => { e.stopPropagation(); decomposeBlock(block.id); }}>Decompose</SmBtn>}
+                      {block.wasEdited && <SmBtn onClick={(e) => {
+                        e.stopPropagation(); pushUndo();
+                        setBlocks(prev => prev.map(b => b.id !== block.id ? b : {
+                          ...b, wasEdited: false, segments: b.segments.map(s => ({ ...s, text: s.originalText })),
+                        }));
+                      }}>Revert</SmBtn>}
+                    </div>
+                  )}
+                  {/* Trim handles */}
+                  {!isEditing && audioUrl && block.segments.length > 0 && (
+                    <>
+                      <div
+                        onMouseDown={(e) => {
+                          e.stopPropagation();
+                          e.preventDefault();
+                          setTrimming({ blockId: block.id, edge: "start", startX: e.clientX, originalTime: blockStart(block) });
+                        }}
+                        style={{
+                          position: "absolute", left: 0, top: 0, bottom: 0, width: 6,
+                          cursor: "w-resize", background: "transparent", borderRadius: "6px 0 0 6px",
+                        }}
+                        onMouseEnter={(e) => { e.currentTarget.style.background = C.accentDim; }}
+                        onMouseLeave={(e) => { if (!trimming) e.currentTarget.style.background = "transparent"; }}
+                        title="Drag to trim/expand start"
+                      />
+                      <div
+                        onMouseDown={(e) => {
+                          e.stopPropagation();
+                          e.preventDefault();
+                          setTrimming({ blockId: block.id, edge: "end", startX: e.clientX, originalTime: blockEnd(block) });
+                        }}
+                        style={{
+                          position: "absolute", right: 0, top: 0, bottom: 0, width: 6,
+                          cursor: "e-resize", background: "transparent", borderRadius: "0 6px 6px 0",
+                        }}
+                        onMouseEnter={(e) => { e.currentTarget.style.background = C.accentDim; }}
+                        onMouseLeave={(e) => { if (!trimming) e.currentTarget.style.background = "transparent"; }}
+                        title="Drag to trim/expand end"
+                      />
+                    </>
                   )}
                 </div>
+              );
+            };
 
-                {/* Paragraph text */}
-                {isEditing ? (
-                  <div>
-                    <textarea
-                      autoFocus value={editText} onChange={(e) => setEditText(e.target.value)}
-                      onKeyDown={(e) => { if (e.key === "Escape") cancelEdit(); }}
-                      style={{
-                        width: "100%", background: C.surface, border: `1px solid ${C.accent}`, borderRadius: 4,
-                        color: C.text, fontFamily: "'Newsreader', Georgia, serif", fontSize: 17, lineHeight: 1.75,
-                        padding: "12px 14px", resize: "vertical", minHeight: 80,
-                      }}
-                    />
-                    <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-                      <SmBtn onClick={commitEdit} accent>Save</SmBtn>
-                      <SmBtn onClick={() => {
-                        // Split at cursor position
-                        const ta = document.querySelector("textarea:focus");
-                        if (ta && ta.selectionStart > 0 && ta.selectionStart < editText.length) {
-                          cancelEdit();
-                          splitBlock(block.id, ta.selectionStart);
-                        }
-                      }}>Split at cursor</SmBtn>
-                      <SmBtn onClick={cancelEdit}>Cancel</SmBtn>
+            // If no sections exist, render all blocks flat (original behavior)
+            if (sections.length === 0) {
+              return blocks.map((block, idx) => renderBlock(block, idx));
+            }
+
+            // Section-grouped rendering
+            return (
+              <>
+                {/* Unsectioned blocks */}
+                {sectionedBlocks.unsectioned.length > 0 && (
+                  <div style={{ marginBottom: 24 }}>
+                    <div style={{
+                      fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim,
+                      letterSpacing: "0.06em", textTransform: "uppercase", padding: "8px 0",
+                      borderBottom: `1px solid ${C.border}`, marginBottom: 12,
+                    }}>
+                      Unsectioned
                     </div>
+                    {sectionedBlocks.unsectioned.map(({ block, globalIdx }) => renderBlock(block, globalIdx))}
                   </div>
-                ) : (
-                  <p style={{ fontSize: 17, lineHeight: 1.75, margin: 0, color: C.text }}>
-                    {text}
-                  </p>
                 )}
 
-                {/* Hover actions */}
-                {!isEditing && isSelected && (
-                  <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
-                    {audioUrl && <SmBtn onClick={(e) => { e.stopPropagation(); playBlock(block); }}>▶ Play</SmBtn>}
-                    <SmBtn onClick={(e) => { e.stopPropagation(); startEdit(block); }}>✎ Edit</SmBtn>
-                    <SmBtn onClick={(e) => { e.stopPropagation(); pushUndo(); splitBlock(block.id, Math.floor(text.length / 2)); }}>Split ½</SmBtn>
+                {/* Sectioned blocks */}
+                {sectionedBlocks.sections.map((section) => (
+                  <div key={section.id} id={`section-${section.id}`} style={{ marginBottom: 28 }}>
+                    <div
+                      onClick={() => toggleSectionCollapse(section.id)}
+                      style={{
+                        display: "flex", alignItems: "center", gap: 10, padding: "10px 0",
+                        borderBottom: `2px solid ${C.accent}`, marginBottom: 14, cursor: "pointer",
+                      }}
+                    >
+                      <span style={{ fontSize: 12, color: C.textDim }}>{section.collapsed ? "▸" : "▾"}</span>
+                      <h2 style={{
+                        fontFamily: "'Instrument Serif', serif", fontSize: 22, fontWeight: 400,
+                        color: C.text, margin: 0, flex: 1,
+                      }}>
+                        {section.name}
+                      </h2>
+                      <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim }}>
+                        {section.blocks.length} ¶ · {fmtTime(section.duration)}
+                      </span>
+                    </div>
+                    {!section.collapsed && section.blocks.map(({ block, globalIdx }) => renderBlock(block, globalIdx))}
+                    {section.collapsed && section.blocks.length > 0 && (
+                      <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim, padding: "8px 20px", fontStyle: "italic" }}>
+                        {section.blocks.length} paragraphs hidden
+                      </div>
+                    )}
                   </div>
-                )}
-              </div>
+                ))}
+              </>
             );
-          })}
+          })()}
         </div>
+
+        {/* ── Scrub Bar ── */}
+        {audioUrl && hasContent && (
+          <div style={{
+            position: "fixed", bottom: 40, left: "50%", transform: "translateX(-50%)",
+            background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8,
+            padding: "8px 16px", display: "flex", alignItems: "center", gap: 12,
+            boxShadow: "0 2px 12px rgba(0,0,0,0.1)", zIndex: 50, minWidth: 400,
+            fontFamily: "'DM Mono', monospace", fontSize: 10,
+          }}>
+            <span style={{ color: C.textDim, minWidth: 50 }}>{fmtTime(currentTime)}</span>
+            <div
+              onClick={(e) => {
+                const rect = e.currentTarget.getBoundingClientRect();
+                const ratio = (e.clientX - rect.left) / rect.width;
+                const newTime = ratio * audioDuration;
+                if (audioRef.current) { audioRef.current.currentTime = newTime; setCurrentTime(newTime); }
+              }}
+              style={{
+                flex: 1, height: 6, background: C.raised, borderRadius: 3, cursor: "pointer", position: "relative",
+              }}
+            >
+              <div style={{
+                width: `${audioDuration > 0 ? (currentTime / audioDuration) * 100 : 0}%`,
+                height: "100%", background: C.accent, borderRadius: 3, transition: "width 0.1s",
+              }} />
+            </div>
+            <span style={{ color: C.textDim, minWidth: 50, textAlign: "right" }}>{fmtTime(audioDuration)}</span>
+            <button onClick={() => { if (audioRef.current) { if (audioRef.current.paused) audioRef.current.play(); else audioRef.current.pause(); } }}
+              style={{ background: "none", border: "none", color: C.accent, cursor: "pointer", fontSize: 14, padding: "0 4px" }}>
+              {playing ? "■" : "▶"}
+            </button>
+          </div>
+        )}
 
         {/* ── Export Panel ── */}
         {showExport && hasContent && (
@@ -1402,9 +2227,26 @@ export default function OralHistoryEditor() {
                 {blocks.length} paragraphs · {fmtTime(totalDuration)} · {speakers.length} speakers
               </p>
               <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap" }}>
-                <SmBtn onClick={downloadMarkdown} accent>↓ Markdown (.md)</SmBtn>
+                <SmBtn onClick={() => downloadMarkdown()} accent>↓ Markdown (.md)</SmBtn>
                 <SmBtn onClick={downloadProject} accent>↓ Project (.json)</SmBtn>
               </div>
+              {sections.length > 0 && (
+                <div style={{ marginTop: 12 }}>
+                  <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim, marginBottom: 6, letterSpacing: "0.04em" }}>
+                    PER-SECTION EXPORT
+                  </div>
+                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                    {sections.map(section => {
+                      const count = blocks.filter(b => b.sectionId === section.id).length;
+                      return (
+                        <SmBtn key={section.id} onClick={() => downloadMarkdown(section.id)} disabled={count === 0}>
+                          ↓ {section.name} ({count})
+                        </SmBtn>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* MD Preview */}
@@ -1458,7 +2300,123 @@ export default function OralHistoryEditor() {
             </div>
           </div>
         )}
+
+        {/* ── Source Panel ── */}
+        {showSource && hasContent && originalSegments.length > 0 && (
+          <div style={{ width: 300, borderLeft: `1px solid ${C.border}`, background: C.surface, overflowY: "auto", display: "flex", flexDirection: "column", flexShrink: 0 }}>
+            <div style={{ padding: "14px 16px", borderBottom: `1px solid ${C.border}` }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+                <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim, letterSpacing: "0.06em", textTransform: "uppercase" }}>Source Transcript</span>
+                <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: C.textDim }}>{originalSegments.length} segments</span>
+              </div>
+              <input value={sourceSearch} onChange={(e) => setSourceSearch(e.target.value)}
+                placeholder="Search transcript..."
+                style={{ width: "100%", fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "5px 8px", background: C.raised, border: `1px solid ${C.border}`, borderRadius: 4, color: C.text }}
+              />
+              <div style={{ display: "flex", gap: 4, marginTop: 6 }}>
+                <SmBtn onClick={() => setSourceView("all")} accent={sourceView === "all"}>All</SmBtn>
+                <SmBtn onClick={() => setSourceView("unused")} accent={sourceView === "unused"}>Unused</SmBtn>
+              </div>
+            </div>
+            <div style={{ flex: 1, overflowY: "auto", padding: "6px 0" }}>
+              {(() => {
+                // Group originalSegments into ~15s chunks
+                const chunks = [];
+                let chunk = [];
+                let chunkStart = originalSegments[0]?.start || 0;
+                for (const seg of originalSegments) {
+                  chunk.push(seg);
+                  if (seg.end - chunkStart >= 15 || seg === originalSegments[originalSegments.length - 1]) {
+                    chunks.push({ segments: [...chunk], start: chunkStart, end: seg.end });
+                    chunk = [];
+                    chunkStart = seg.end;
+                  }
+                }
+                // Filter by search
+                const filtered = sourceSearch.trim()
+                  ? chunks.filter(c => c.segments.some(s => s.text.toLowerCase().includes(sourceSearch.toLowerCase())))
+                  : chunks;
+                // Filter by view
+                const usedTimes = new Set();
+                blocks.forEach(b => b.segments.forEach(s => usedTimes.add(`${s.start.toFixed(3)}-${s.end.toFixed(3)}`)));
+                const viewFiltered = sourceView === "unused"
+                  ? filtered.filter(c => !c.segments.every(s => usedTimes.has(`${s.start.toFixed(3)}-${s.end.toFixed(3)}`)))
+                  : filtered;
+
+                return viewFiltered.map((chunk, i) => {
+                  const chunkText = chunk.segments.map(s => s.text).join(" ");
+                  const isUsed = chunk.segments.every(s => usedTimes.has(`${s.start.toFixed(3)}-${s.end.toFixed(3)}`));
+                  return (
+                    <div key={i}
+                      draggable
+                      onDragStart={(e) => {
+                        e.dataTransfer.setData("application/json", JSON.stringify(chunk));
+                        e.dataTransfer.effectAllowed = "copy";
+                      }}
+                      style={{
+                        padding: "8px 16px", borderBottom: `1px solid ${C.border}`,
+                        cursor: "grab", opacity: isUsed ? 0.4 : 1,
+                        transition: "background 0.1s",
+                      }}
+                      onMouseEnter={(e) => { e.currentTarget.style.background = C.raised; }}
+                      onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}
+                    >
+                      <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: C.accent, marginBottom: 3 }}>
+                        {fmtTime(chunk.start)} — {fmtTime(chunk.end)}
+                        {isUsed && <span style={{ marginLeft: 6, color: C.textDim }}>(used)</span>}
+                      </div>
+                      <p style={{ fontFamily: "'Newsreader', Georgia, serif", fontSize: 12, lineHeight: 1.5, color: C.text, margin: 0 }}>
+                        {sourceSearch.trim() ? (
+                          chunkText.split(new RegExp(`(${sourceSearch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi')).map((part, j) =>
+                            part.toLowerCase() === sourceSearch.toLowerCase()
+                              ? <mark key={j} style={{ background: C.accentDim, color: C.accent }}>{part}</mark>
+                              : part
+                          )
+                        ) : (
+                          chunkText.length > 120 ? chunkText.slice(0, 120) + "\u2026" : chunkText
+                        )}
+                      </p>
+                    </div>
+                  );
+                });
+              })()}
+            </div>
+          </div>
+        )}
       </div>
+
+      {/* ── AI Suggestions Modal ── */}
+      {aiSuggestions?.sections && (
+        <div style={{
+          position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100,
+        }} onClick={() => setAiSuggestions(null)}>
+          <div onClick={(e) => e.stopPropagation()} style={{
+            background: C.surface, borderRadius: 12, padding: "24px 28px", maxWidth: 500, width: "90%",
+            maxHeight: "80vh", overflowY: "auto", border: `1px solid ${C.border}`,
+          }}>
+            <h3 style={{ fontFamily: "'Instrument Serif', serif", fontSize: 22, fontWeight: 400, marginBottom: 16 }}>AI Suggested Sections</h3>
+            {aiSuggestions.sections.map((sec, i) => (
+              <label key={i} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 0", borderBottom: `1px solid ${C.border}`, cursor: "pointer" }}>
+                <input type="checkbox" checked={aiSelectedSections.has(i)}
+                  onChange={() => setAiSelectedSections(prev => { const n = new Set(prev); n.has(i) ? n.delete(i) : n.add(i); return n; })} />
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: C.text }}>{sec.name}</div>
+                  <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim }}>
+                    Blocks {sec.startBlock}–{sec.endBlock} ({sec.endBlock - sec.startBlock + 1} paragraphs)
+                  </div>
+                </div>
+              </label>
+            ))}
+            <div style={{ display: "flex", gap: 8, marginTop: 16 }}>
+              <SmBtn onClick={() => setAiSelectedSections(new Set(aiSuggestions.sections.map((_, i) => i)))}>Select All</SmBtn>
+              <SmBtn onClick={() => setAiSelectedSections(new Set())}>Deselect All</SmBtn>
+              <div style={{ flex: 1 }} />
+              <SmBtn onClick={() => setAiSuggestions(null)}>Cancel</SmBtn>
+              <SmBtn onClick={() => { applyAiSuggestions([...aiSelectedSections]); setAiSelectedSections(new Set()); }} accent disabled={aiSelectedSections.size === 0}>Apply Selected</SmBtn>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── Footer ── */}
       {hasContent && (
@@ -1467,8 +2425,9 @@ export default function OralHistoryEditor() {
           fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.border, display: "flex", gap: 14, flexWrap: "wrap",
         }}>
           <span>Click select</span><span>Shift range</span><span>⌘ multi</span>
-          <span>✎ edit text</span><span>Drag reorder</span>
+          <span>✎ edit text</span><span>Drag reorder</span><span>Click word to play</span>
           <span>1–9 assign speaker</span><span>0 clear</span><span>⌘Z undo</span>
+          <span>Sections organize files</span><span>Drag edges to trim</span>
         </div>
       )}
     </div>
