@@ -1535,7 +1535,14 @@ Return ONLY valid JSON, no other text.`;
               <div style={{ display: "flex", flexDirection: "column", borderBottom: showSpeakers ? `1px solid ${C.border}` : "none", maxHeight: showSpeakers ? "50%" : "100%", overflow: "hidden" }}>
                 <div style={{ padding: "14px 16px", borderBottom: `1px solid ${C.border}`, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
                   <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim, letterSpacing: "0.06em", textTransform: "uppercase" }}>Sections</span>
-                  <button onClick={() => setAddingSection(true)} style={{ fontFamily: "'DM Mono', monospace", fontSize: 15, background: "none", border: "none", color: C.accent, cursor: "pointer", padding: "0 4px", lineHeight: 1 }}>+</button>
+                  <div style={{ display: "flex", gap: 2, alignItems: "center" }}>
+                    <button onClick={analyzeTranscript} disabled={aiAnalyzing || blocks.length === 0}
+                      style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, background: "none", border: "none", color: aiAnalyzing ? C.textDim : C.accent, cursor: aiAnalyzing ? "default" : "pointer", padding: "0 4px", lineHeight: 1 }}
+                      title="AI auto-section">
+                      {aiAnalyzing ? "…" : "AI"}
+                    </button>
+                    <button onClick={() => setAddingSection(true)} style={{ fontFamily: "'DM Mono', monospace", fontSize: 15, background: "none", border: "none", color: C.accent, cursor: "pointer", padding: "0 4px", lineHeight: 1 }}>+</button>
+                  </div>
                 </div>
                 <div style={{ flex: 1, overflowY: "auto", padding: "6px 0" }}>
                   {/* Unsectioned count */}
@@ -1800,15 +1807,17 @@ Return ONLY valid JSON, no other text.`;
                   {isEditing ? (
                     <div>
                       <textarea
-                        autoFocus value={editText} onChange={(e) => setEditText(e.target.value)}
+                        autoFocus value={editText} onChange={(e) => { setEditText(e.target.value); e.target.style.height = "auto"; e.target.style.height = e.target.scrollHeight + "px"; }}
                         onKeyDown={(e) => { if (e.key === "Escape") cancelEdit(); }}
+                        ref={(el) => { if (el) { el.style.height = "auto"; el.style.height = el.scrollHeight + "px"; } }}
                         style={{
                           width: "100%", background: C.surface, border: `1px solid ${C.accent}`, borderRadius: 4,
                           color: C.text, fontFamily: "'Newsreader', Georgia, serif", fontSize: 17, lineHeight: 1.75,
-                          padding: "12px 14px", resize: "vertical", minHeight: 80,
+                          padding: "12px 14px", resize: "vertical", minHeight: Math.min(Math.max(200, text.length / 2), 500),
+                          maxHeight: "60vh", overflow: "auto",
                         }}
                       />
-                      <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                      <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
                         <SmBtn onClick={commitEdit} accent>Save</SmBtn>
                         <SmBtn onClick={() => {
                           const ta = document.querySelector("textarea:focus");
@@ -1986,6 +1995,39 @@ Return ONLY valid JSON, no other text.`;
           </div>
         )}
       </div>
+
+      {/* ── AI Suggestions Modal ── */}
+      {aiSuggestions?.sections && (
+        <div style={{
+          position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100,
+        }} onClick={() => setAiSuggestions(null)}>
+          <div onClick={(e) => e.stopPropagation()} style={{
+            background: C.surface, borderRadius: 12, padding: "24px 28px", maxWidth: 500, width: "90%",
+            maxHeight: "80vh", overflowY: "auto", border: `1px solid ${C.border}`,
+          }}>
+            <h3 style={{ fontFamily: "'Instrument Serif', serif", fontSize: 22, fontWeight: 400, marginBottom: 16 }}>AI Suggested Sections</h3>
+            {aiSuggestions.sections.map((sec, i) => (
+              <label key={i} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 0", borderBottom: `1px solid ${C.border}`, cursor: "pointer" }}>
+                <input type="checkbox" checked={aiSelectedSections.has(i)}
+                  onChange={() => setAiSelectedSections(prev => { const n = new Set(prev); n.has(i) ? n.delete(i) : n.add(i); return n; })} />
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color: C.text }}>{sec.name}</div>
+                  <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim }}>
+                    Blocks {sec.startBlock}–{sec.endBlock} ({sec.endBlock - sec.startBlock + 1} paragraphs)
+                  </div>
+                </div>
+              </label>
+            ))}
+            <div style={{ display: "flex", gap: 8, marginTop: 16 }}>
+              <SmBtn onClick={() => setAiSelectedSections(new Set(aiSuggestions.sections.map((_, i) => i)))}>Select All</SmBtn>
+              <SmBtn onClick={() => setAiSelectedSections(new Set())}>Deselect All</SmBtn>
+              <div style={{ flex: 1 }} />
+              <SmBtn onClick={() => setAiSuggestions(null)}>Cancel</SmBtn>
+              <SmBtn onClick={() => { applyAiSuggestions([...aiSelectedSections]); setAiSelectedSections(new Set()); }} accent disabled={aiSelectedSections.size === 0}>Apply Selected</SmBtn>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── Footer ── */}
       {hasContent && (
