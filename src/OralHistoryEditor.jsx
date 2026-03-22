@@ -368,6 +368,14 @@ export default function OralHistoryEditor() {
   // Source tags
   const [sourceTags, setSourceTags] = useState({});
 
+  // Source panel search
+  const [sourceSearch, setSourceSearch] = useState("");
+  const [sourceView, setSourceView] = useState("all"); // "all" | "unused" | "bytag"
+  const [showSource, setShowSource] = useState(false);
+
+  // Trim handles
+  const [trimming, setTrimming] = useState(null); // { blockId, edge: "start"|"end", startX, originalTime }
+
   // Edit history
   const [expandedEdit, setExpandedEdit] = useState(false);
 
@@ -1123,6 +1131,73 @@ export default function OralHistoryEditor() {
     return () => window.removeEventListener("keydown", handler);
   }, [editingId, doCopy, doCut, doPaste, doDelete, undo, selected, speakers, assignAndMerge, addingSpeaker, editingSpeakerId, blocks, pushUndo]);
 
+  // Trim handle drag
+  useEffect(() => {
+    if (!trimming) return;
+    const PX_PER_SEC = 20; // 20 pixels = 1 second
+    const handleMove = (e) => {
+      const deltaX = e.clientX - trimming.startX;
+      const deltaSec = deltaX / PX_PER_SEC;
+      const newTime = trimming.originalTime + deltaSec;
+      // Show tooltip with time offset
+      document.title = `${deltaSec >= 0 ? "+" : ""}${deltaSec.toFixed(1)}s → ${fmtTime(newTime)}`;
+    };
+    const handleUp = (e) => {
+      const deltaX = e.clientX - trimming.startX;
+      const deltaSec = deltaX / PX_PER_SEC;
+      if (Math.abs(deltaSec) < 0.2) { setTrimming(null); document.title = "Oral History Editor"; return; }
+
+      pushUndo();
+      setBlocks(prev => prev.map(b => {
+        if (b.id !== trimming.blockId) return b;
+        const sorted = [...b.segments].sort((a, bb) => a.start - bb.start);
+        if (trimming.edge === "start") {
+          const newStart = trimming.originalTime + deltaSec;
+          if (deltaSec > 0) {
+            // Trimming start forward: remove segments that are fully before newStart
+            const remaining = sorted.filter(s => s.end > newStart);
+            if (remaining.length === 0) return b;
+            remaining[0] = { ...remaining[0], start: Math.max(remaining[0].start, newStart) };
+            return { ...b, segments: remaining, wasEdited: true };
+          } else {
+            // Expanding start backward: extend first segment
+            const expanded = [...sorted];
+            expanded[0] = { ...expanded[0], start: newStart };
+            // Try to pull in original segments
+            const origBefore = originalSegments.filter(s => s.end > newStart && s.end <= sorted[0].start);
+            const newSegs = origBefore.map(s => ({ ...s, id: uid() }));
+            return { ...b, segments: [...newSegs, ...expanded], wasEdited: true };
+          }
+        } else {
+          const newEnd = trimming.originalTime + deltaSec;
+          if (deltaSec < 0) {
+            // Trimming end backward: remove segments fully after newEnd
+            const remaining = sorted.filter(s => s.start < newEnd);
+            if (remaining.length === 0) return b;
+            remaining[remaining.length - 1] = { ...remaining[remaining.length - 1], end: Math.min(remaining[remaining.length - 1].end, newEnd) };
+            return { ...b, segments: remaining, wasEdited: true };
+          } else {
+            // Expanding end forward: extend last segment
+            const expanded = [...sorted];
+            expanded[expanded.length - 1] = { ...expanded[expanded.length - 1], end: newEnd };
+            // Try to pull in original segments
+            const origAfter = originalSegments.filter(s => s.start >= sorted[sorted.length - 1].end && s.start < newEnd);
+            const newSegs = origAfter.map(s => ({ ...s, id: uid() }));
+            return { ...b, segments: [...expanded, ...newSegs], wasEdited: true };
+          }
+        }
+      }));
+      setTrimming(null);
+      document.title = "Oral History Editor";
+    };
+    window.addEventListener("mousemove", handleMove);
+    window.addEventListener("mouseup", handleUp);
+    return () => {
+      window.removeEventListener("mousemove", handleMove);
+      window.removeEventListener("mouseup", handleUp);
+    };
+  }, [trimming, originalSegments, pushUndo]);
+
   useEffect(() => { if (addingSpeaker && newSpkRef.current) newSpkRef.current.focus(); }, [addingSpeaker]);
   useEffect(() => { if (editingSpeakerId && editSpkRef.current) editSpkRef.current.focus(); }, [editingSpeakerId]);
   useEffect(() => { if (addingSection && newSectionRef.current) newSectionRef.current.focus(); }, [addingSection]);
@@ -1572,6 +1647,7 @@ Return ONLY valid JSON, no other text.`;
           <Sep />
           <TBtn onClick={() => setShowSpeakers(!showSpeakers)} label={showSpeakers ? "◂ Speakers" : "▸ Speakers"} />
           <TBtn onClick={() => setShowTOC(!showTOC)} label={showTOC ? "◂ Sections" : "▸ Sections"} />
+          <TBtn onClick={() => setShowSource(!showSource)} label={showSource ? "◂ Source" : "▸ Source"} />
           <div style={{ flex: 1 }} />
           <span style={{ color: C.textDim, fontSize: 10 }}>
             {blocks.length} ¶ · {fmtTime(totalDuration)}
@@ -1788,7 +1864,32 @@ Return ONLY valid JSON, no other text.`;
         )}
 
         {/* ── Main Content: Paragraph View ── */}
-        <div ref={editorContentRef} style={{ flex: 1, overflowY: "auto", padding: "32px 48px 100px", maxWidth: 800, margin: "0 auto", width: "100%" }}>
+        <div ref={editorContentRef} style={{ flex: 1, overflowY: "auto", padding: "32px 48px 100px", maxWidth: 800, margin: "0 auto", width: "100%" }}
+          onDragOver={(e) => {
+            if (e.dataTransfer.types.includes("application/json")) {
+              e.preventDefault();
+              e.dataTransfer.dropEffect = "copy";
+            }
+          }}
+          onDrop={(e) => {
+            try {
+              const chunkData = JSON.parse(e.dataTransfer.getData("application/json"));
+              if (chunkData?.segments) {
+                pushUndo();
+                const newBlock = {
+                  id: uid(), speaker: null, sectionId: null,
+                  wasMoved: false, wasEdited: false,
+                  segments: chunkData.segments.map(s => ({
+                    id: uid(), text: s.text, originalText: s.originalText || s.text,
+                    start: s.start, end: s.end, originalIndex: s.originalIndex || 0,
+                  })),
+                };
+                setBlocks(prev => [...prev, newBlock]);
+                setSelected(new Set([newBlock.id]));
+              }
+            } catch (err) { /* ignore invalid drops */ }
+          }}
+        >
           {!hasContent && (
             <div style={{ textAlign: "center", padding: "80px 20px" }}>
               <p style={{ fontFamily: "'Instrument Serif', serif", fontSize: 32, color: C.text, marginBottom: 12 }}>Begin an oral history</p>
@@ -1989,6 +2090,39 @@ Return ONLY valid JSON, no other text.`;
                         }));
                       }}>Revert</SmBtn>}
                     </div>
+                  )}
+                  {/* Trim handles */}
+                  {!isEditing && audioUrl && block.segments.length > 0 && (
+                    <>
+                      <div
+                        onMouseDown={(e) => {
+                          e.stopPropagation();
+                          e.preventDefault();
+                          setTrimming({ blockId: block.id, edge: "start", startX: e.clientX, originalTime: blockStart(block) });
+                        }}
+                        style={{
+                          position: "absolute", left: 0, top: 0, bottom: 0, width: 6,
+                          cursor: "w-resize", background: "transparent", borderRadius: "6px 0 0 6px",
+                        }}
+                        onMouseEnter={(e) => { e.currentTarget.style.background = C.accentDim; }}
+                        onMouseLeave={(e) => { if (!trimming) e.currentTarget.style.background = "transparent"; }}
+                        title="Drag to trim/expand start"
+                      />
+                      <div
+                        onMouseDown={(e) => {
+                          e.stopPropagation();
+                          e.preventDefault();
+                          setTrimming({ blockId: block.id, edge: "end", startX: e.clientX, originalTime: blockEnd(block) });
+                        }}
+                        style={{
+                          position: "absolute", right: 0, top: 0, bottom: 0, width: 6,
+                          cursor: "e-resize", background: "transparent", borderRadius: "0 6px 6px 0",
+                        }}
+                        onMouseEnter={(e) => { e.currentTarget.style.background = C.accentDim; }}
+                        onMouseLeave={(e) => { if (!trimming) e.currentTarget.style.background = "transparent"; }}
+                        title="Drag to trim/expand end"
+                      />
+                    </>
                   )}
                 </div>
               );
