@@ -340,6 +340,35 @@ export default function OralHistoryEditor() {
   const [autoSaveEnabled, setAutoSaveEnabled] = useState(false);
   const autoSaveTimerRef = useRef(null);
 
+  // Sections
+  const [sections, setSections] = useState([]);
+  const [showTOC, setShowTOC] = useState(true);
+  const [activeSectionId, setActiveSectionId] = useState(null);
+  const [addingSection, setAddingSection] = useState(false);
+  const [newSectionName, setNewSectionName] = useState("");
+  const [editingSectionId, setEditingSectionId] = useState(null);
+  const [editingSectionName, setEditingSectionName] = useState("");
+
+  // Original segments pool (for search/trim features)
+  const [originalSegments, setOriginalSegments] = useState([]);
+
+  // AI provider
+  const [aiProvider, setAiProvider] = useState("anthropic");
+  const [anthropicApiKey, setAnthropicApiKey] = useState("");
+  const [aiAnalyzing, setAiAnalyzing] = useState(false);
+  const [aiSuggestions, setAiSuggestions] = useState(null);
+
+  // Source tags
+  const [sourceTags, setSourceTags] = useState({});
+
+  // Edit history
+  const [expandedEdit, setExpandedEdit] = useState(false);
+
+  // Audio sync
+  const [playingSegId, setPlayingSegId] = useState(null);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [audioDuration, setAudioDuration] = useState(0);
+
   const audioRef = useRef(null);
   const audioFileRef = useRef(null);
   const playTimerRef = useRef(null);
@@ -347,6 +376,9 @@ export default function OralHistoryEditor() {
   const editSpkRef = useRef(null);
   const projectUploadRef = useRef(null);
   const transcribeCancelRef = useRef(false);
+  const newSectionRef = useRef(null);
+  const editSectionRef = useRef(null);
+  const editorContentRef = useRef(null);
 
   /* ── File handling ── */
   const handleAudioUpload = (e) => {
@@ -446,7 +478,7 @@ export default function OralHistoryEditor() {
 
         // Update blocks progressively so user sees results stream in
         const newBlocks = allSegs.map((seg) => ({
-          id: uid(), speaker: null, segments: [seg], wasMoved: false, wasEdited: false,
+          id: uid(), speaker: null, segments: [seg], wasMoved: false, wasEdited: false, sectionId: null,
         }));
         setBlocks(mergeAdjacentBlocks(newBlocks));
         setTranscriptionProgress({ completed: i + 1, total: totalChunks, segments: allSegs });
@@ -454,6 +486,7 @@ export default function OralHistoryEditor() {
       }
 
       if (allSegs.length === 0) throw new Error("No segments returned");
+      setOriginalSegments(allSegs.map(s => ({...s})));
       setSubName("(transcribed)");
       setTranscriptionProgress(null);
       clearInterval(timer);
@@ -491,12 +524,14 @@ export default function OralHistoryEditor() {
         } catch (err) { /* not valid JSON, fall through to subtitle parsing */ }
       }
       const segments = detectAndParse(ev.target.result);
+      setOriginalSegments(segments.map(s => ({...s})));
       const newBlocks = segments.map((seg) => ({
         id: uid(),
         speaker: null,
         segments: [seg],
         wasMoved: false,
         wasEdited: false,
+        sectionId: null,
       }));
       setBlocks(mergeAdjacentBlocks(newBlocks));
       setSelected(new Set());
@@ -534,6 +569,9 @@ export default function OralHistoryEditor() {
         bg: SPEAKER_PALETTE.find((p) => p.color === s.color)?.bg || SPEAKER_PALETTE[0].bg,
       })));
     }
+    if (proj.sections && Array.isArray(proj.sections)) {
+      setSections(proj.sections.map(s => ({ id: s.id || uid(), name: s.name, collapsed: false })));
+    }
     const spkNameToId = {};
     (proj.speakers || []).forEach((s) => { spkNameToId[s.name] = s.id || uid(); });
     const restored = proj.blocks.map((b) => ({
@@ -541,6 +579,7 @@ export default function OralHistoryEditor() {
       speaker: b.speakerId || (b.speaker ? spkNameToId[b.speaker] : null) || null,
       wasMoved: b.wasMoved || false,
       wasEdited: b.wasEdited || false,
+      sectionId: b.sectionId || null,
       segments: (b.segments || []).map((seg) => ({
         id: uid(),
         text: seg.text,
@@ -562,12 +601,19 @@ export default function OralHistoryEditor() {
 
   /* ── Undo ── */
   const pushUndo = useCallback(() => {
-    setUndoStack((prev) => [...prev.slice(-30), JSON.parse(JSON.stringify(blocks))]);
-  }, [blocks]);
+    setUndoStack((prev) => [...prev.slice(-30), { blocks: JSON.parse(JSON.stringify(blocks)), sections: JSON.parse(JSON.stringify(sections)) }]);
+  }, [blocks, sections]);
 
   const undo = useCallback(() => {
     if (undoStack.length === 0) return;
-    setBlocks(undoStack[undoStack.length - 1]);
+    const snapshot = undoStack[undoStack.length - 1];
+    if (snapshot.blocks) {
+      setBlocks(snapshot.blocks);
+      if (snapshot.sections) setSections(snapshot.sections);
+    } else {
+      // Backwards compat with old undo entries that were just block arrays
+      setBlocks(snapshot);
+    }
     setUndoStack((s) => s.slice(0, -1));
     setSelected(new Set());
     setEditingId(null);
@@ -699,6 +745,7 @@ export default function OralHistoryEditor() {
       segments: sel.flatMap((b) => b.segments),
       wasMoved: sel.some((b) => b.wasMoved),
       wasEdited: true,
+      sectionId: sel[0].sectionId || null,
     };
     const firstIdx = blocks.findIndex((b) => selected.has(b.id));
     const next = blocks.filter((b) => !selected.has(b.id));
@@ -748,8 +795,8 @@ export default function OralHistoryEditor() {
 
       if (segs1.length === 0 || segs2.length === 0) return prev;
 
-      const b1 = { id: uid(), speaker: block.speaker, segments: segs1, wasMoved: block.wasMoved, wasEdited: true };
-      const b2 = { id: uid(), speaker: block.speaker, segments: segs2, wasMoved: block.wasMoved, wasEdited: true };
+      const b1 = { id: uid(), speaker: block.speaker, segments: segs1, wasMoved: block.wasMoved, wasEdited: true, sectionId: block.sectionId || null };
+      const b2 = { id: uid(), speaker: block.speaker, segments: segs2, wasMoved: block.wasMoved, wasEdited: true, sectionId: block.sectionId || null };
       const next = [...prev];
       next.splice(idx, 1, b1, b2);
       return next;
@@ -891,17 +938,20 @@ export default function OralHistoryEditor() {
 
   useEffect(() => { if (addingSpeaker && newSpkRef.current) newSpkRef.current.focus(); }, [addingSpeaker]);
   useEffect(() => { if (editingSpeakerId && editSpkRef.current) editSpkRef.current.focus(); }, [editingSpeakerId]);
+  useEffect(() => { if (addingSection && newSectionRef.current) newSectionRef.current.focus(); }, [addingSection]);
+  useEffect(() => { if (editingSectionId && editSectionRef.current) editSectionRef.current.focus(); }, [editingSectionId]);
 
   /* ── Full project state for save ── */
   const buildProjectState = useCallback(() => {
     const speakerMap = {};
     speakers.forEach((s) => { speakerMap[s.id] = s.name; });
     return {
-      version: 1,
+      version: 2,
       title: projectTitle,
       sourceFile: audioName || "source.wav",
       totalDuration: +(blocks.reduce((sum, b) => sum + b.segments.reduce((s2, seg) => s2 + (seg.end - seg.start), 0), 0)).toFixed(3),
       speakers: speakers.map((s) => ({ id: s.id, name: s.name, color: s.color })),
+      sections: sections.map((s, i) => ({ id: s.id, name: s.name, order: i + 1 })),
       blocks: blocks.map((b, i) => {
         let effId = b.speaker;
         if (!effId) { for (let j = i - 1; j >= 0; j--) { if (blocks[j].speaker) { effId = blocks[j].speaker; break; } } }
@@ -910,6 +960,9 @@ export default function OralHistoryEditor() {
           speaker: effId ? (speakerMap[effId] || null) : null,
           speakerId: b.speaker,
           explicitSpeaker: !!b.speaker,
+          sectionId: b.sectionId || null,
+          type: b.type || "paragraph",
+          editHistory: b.editHistory || [],
           text: b.segments.map((s) => s.text).join(" "),
           wasEdited: b.wasEdited,
           wasMoved: b.wasMoved,
@@ -922,7 +975,7 @@ export default function OralHistoryEditor() {
         };
       }),
     };
-  }, [blocks, speakers, audioName, projectTitle]);
+  }, [blocks, speakers, sections, audioName, projectTitle]);
 
   /* ── Cloud sync via n8n webhooks ── */
   const cloudSave = useCallback(async () => {
