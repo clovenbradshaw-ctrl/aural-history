@@ -357,6 +357,7 @@ export default function OralHistoryEditor() {
   const [anthropicApiKey, setAnthropicApiKey] = useState("");
   const [aiAnalyzing, setAiAnalyzing] = useState(false);
   const [aiSuggestions, setAiSuggestions] = useState(null);
+  const [aiSelectedSections, setAiSelectedSections] = useState(new Set());
 
   // Source tags
   const [sourceTags, setSourceTags] = useState({});
@@ -852,6 +853,88 @@ export default function OralHistoryEditor() {
     });
   }, [pushUndo]);
 
+  /* ── Split by sentence ── */
+  const splitBySentence = useCallback((blockId) => {
+    pushUndo();
+    setBlocks(prev => {
+      const idx = prev.findIndex(b => b.id === blockId);
+      if (idx === -1) return prev;
+      const block = prev[idx];
+      const fullText = block.segments.map(s => s.text).join(" ");
+      // Find sentence boundaries
+      const sentences = [];
+      let last = 0;
+      const regex = /[.!?]+[\s"')\]]*(?=[A-Z])/g;
+      let match;
+      while ((match = regex.exec(fullText)) !== null) {
+        sentences.push(fullText.slice(last, match.index + match[0].length).trim());
+        last = match.index + match[0].length;
+      }
+      if (last < fullText.length) sentences.push(fullText.slice(last).trim());
+      if (sentences.length <= 1) return prev;
+
+      // Create new blocks for each sentence
+      const totalDur = block.segments.reduce((s, seg) => s + (seg.end - seg.start), 0);
+      const startTime = Math.min(...block.segments.map(s => s.start));
+      const newBlocks = sentences.filter(s => s.length > 0).map((sentence, i) => {
+        const charRatio = sentence.length / fullText.length;
+        const segStart = startTime + (totalDur * (sentences.slice(0, i).join("").length / fullText.length));
+        const segEnd = segStart + totalDur * charRatio;
+        return {
+          id: uid(), speaker: block.speaker, sectionId: block.sectionId || null,
+          wasMoved: block.wasMoved, wasEdited: true,
+          segments: [{ id: uid(), text: sentence, originalText: sentence, start: segStart, end: segEnd, originalIndex: 0 }],
+        };
+      });
+      const next = [...prev];
+      next.splice(idx, 1, ...newBlocks);
+      return next;
+    });
+  }, [pushUndo]);
+
+  /* ── Split at largest pause ── */
+  const splitAtPause = useCallback((blockId) => {
+    pushUndo();
+    setBlocks(prev => {
+      const idx = prev.findIndex(b => b.id === blockId);
+      if (idx === -1) return prev;
+      const block = prev[idx];
+      if (block.segments.length < 2) return prev;
+      const sorted = [...block.segments].sort((a, b) => a.start - b.start);
+      let maxGap = 0, maxGapIdx = 0;
+      for (let i = 1; i < sorted.length; i++) {
+        const gap = sorted[i].start - sorted[i - 1].end;
+        if (gap > maxGap) { maxGap = gap; maxGapIdx = i; }
+      }
+      if (maxGap <= 0) return prev;
+      const segs1 = sorted.slice(0, maxGapIdx);
+      const segs2 = sorted.slice(maxGapIdx);
+      const b1 = { id: uid(), speaker: block.speaker, segments: segs1, wasMoved: block.wasMoved, wasEdited: true, sectionId: block.sectionId || null };
+      const b2 = { id: uid(), speaker: block.speaker, segments: segs2, wasMoved: block.wasMoved, wasEdited: true, sectionId: block.sectionId || null };
+      const next = [...prev];
+      next.splice(idx, 1, b1, b2);
+      return next;
+    });
+  }, [pushUndo]);
+
+  /* ── Decompose block to individual segments ── */
+  const decomposeBlock = useCallback((blockId) => {
+    pushUndo();
+    setBlocks(prev => {
+      const idx = prev.findIndex(b => b.id === blockId);
+      if (idx === -1) return prev;
+      const block = prev[idx];
+      if (block.segments.length <= 1) return prev;
+      const newBlocks = block.segments.map(seg => ({
+        id: uid(), speaker: block.speaker, segments: [{ ...seg, id: uid() }],
+        wasMoved: block.wasMoved, wasEdited: false, sectionId: block.sectionId || null,
+      }));
+      const next = [...prev];
+      next.splice(idx, 1, ...newBlocks);
+      return next;
+    });
+  }, [pushUndo]);
+
   /* ── Inline text edit ── */
   const startEdit = (block) => { setEditingId(block.id); setEditText(blockText(block)); };
 
@@ -1086,6 +1169,101 @@ export default function OralHistoryEditor() {
     }
   }, [webhookBase, driveFileId]);
 
+  /* ── AI Analysis ── */
+  const callAI = useCallback(async (systemPrompt, userContent) => {
+    if (aiProvider === "anthropic") {
+      if (!anthropicApiKey.trim()) throw new Error("Enter your Anthropic API key in Settings");
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": anthropicApiKey.trim(),
+          "anthropic-version": "2023-06-01",
+          "anthropic-dangerous-direct-browser-access": "true",
+        },
+        body: JSON.stringify({
+          model: "claude-haiku-4-5-20251001",
+          max_tokens: 4096,
+          messages: [{ role: "user", content: systemPrompt + "\n\n" + userContent }],
+        }),
+      });
+      if (!res.ok) { const err = await res.json().catch(() => ({})); throw new Error(err.error?.message || `Anthropic API error ${res.status}`); }
+      const data = await res.json();
+      const text = data.content?.[0]?.text || "";
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) throw new Error("AI response did not contain valid JSON");
+      return JSON.parse(jsonMatch[0]);
+    } else {
+      if (!openaiApiKey.trim()) throw new Error("Enter your OpenAI API key in Settings");
+      const res = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${openaiApiKey.trim()}` },
+        body: JSON.stringify({
+          model: "gpt-4o-mini",
+          messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userContent }],
+          response_format: { type: "json_object" },
+          temperature: 0.3,
+        }),
+      });
+      if (!res.ok) { const err = await res.json().catch(() => ({})); throw new Error(err.error?.message || `OpenAI API error ${res.status}`); }
+      const data = await res.json();
+      return JSON.parse(data.choices[0].message.content);
+    }
+  }, [aiProvider, anthropicApiKey, openaiApiKey]);
+
+  const analyzeTranscript = useCallback(async () => {
+    if (blocks.length === 0) return;
+    setAiAnalyzing(true);
+    setSyncStatus("saving");
+    setSyncMsg("Analyzing transcript with AI...");
+    try {
+      // Build condensed transcript
+      const condensed = blocks.map((b, i) => {
+        const spk = speakers.find(s => s.id === b.speaker)?.name || "";
+        const text = b.segments.map(s => s.text).join(" ").slice(0, 80);
+        return `[${i}] ${spk ? spk + ": " : ""}${text}...`;
+      }).join("\n");
+
+      const systemPrompt = `You are analyzing an oral history transcript to identify natural topic sections and tags. Return a JSON object with:
+- "sections": array of { "name": string, "startBlock": number, "endBlock": number } identifying natural topic/chapter boundaries
+- "tags": array of { "startBlock": number, "endBlock": number, "tags": string[] } identifying key topics discussed in block ranges
+
+Keep section names concise (3-6 words). Identify 3-10 sections. Tag with 1-3 relevant topic keywords per range.
+Return ONLY valid JSON, no other text.`;
+
+      const result = await callAI(systemPrompt, condensed);
+      setAiSuggestions(result);
+      setSyncStatus("loaded");
+      setSyncMsg("AI analysis complete — review suggestions");
+      setTimeout(() => setSyncStatus(null), 3000);
+    } catch (err) {
+      setSyncStatus("error");
+      setSyncMsg("AI analysis failed: " + err.message);
+      setTimeout(() => setSyncStatus(null), 5000);
+    } finally {
+      setAiAnalyzing(false);
+    }
+  }, [blocks, speakers, callAI]);
+
+  const applyAiSuggestions = useCallback((selectedSections) => {
+    if (!aiSuggestions?.sections) return;
+    pushUndo();
+    const newSections = [];
+    const blockUpdates = {};
+    selectedSections.forEach(idx => {
+      const suggestion = aiSuggestions.sections[idx];
+      if (!suggestion) return;
+      const secId = uid();
+      newSections.push({ id: secId, name: suggestion.name, collapsed: false });
+      for (let i = suggestion.startBlock; i <= Math.min(suggestion.endBlock, blocks.length - 1); i++) {
+        blockUpdates[blocks[i].id] = secId;
+      }
+    });
+    setSections(prev => [...prev, ...newSections]);
+    setBlocks(prev => prev.map(b => blockUpdates[b.id] ? { ...b, sectionId: blockUpdates[b.id] } : b));
+    setAiSuggestions(null);
+  }, [aiSuggestions, blocks, pushUndo]);
+
   /* ── Periodic auto-save ── */
   const AUTO_SAVE_INTERVAL = 3 * 60 * 1000; // 3 minutes
   useEffect(() => {
@@ -1286,6 +1464,19 @@ export default function OralHistoryEditor() {
             <input value={openaiApiKey} onChange={(e) => setOpenaiApiKey(e.target.value)}
               type="password" placeholder="sk-..."
               style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, padding: "4px 8px", background: C.surface, border: `1px solid ${C.border}`, borderRadius: 4, color: C.text, width: 260 }} />
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+            <label style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim }}>Anthropic API Key</label>
+            <input value={anthropicApiKey} onChange={(e) => setAnthropicApiKey(e.target.value)}
+              type="password" placeholder="sk-ant-..."
+              style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, padding: "4px 8px", background: C.surface, border: `1px solid ${C.border}`, borderRadius: 4, color: C.text, width: 260 }} />
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+            <label style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim }}>AI Provider</label>
+            <div style={{ display: "flex", gap: 4 }}>
+              <SmBtn onClick={() => setAiProvider("anthropic")} accent={aiProvider === "anthropic"}>Anthropic</SmBtn>
+              <SmBtn onClick={() => setAiProvider("openai")} accent={aiProvider === "openai"}>OpenAI</SmBtn>
+            </div>
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
             <label style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim }}>Google Drive File ID</label>
@@ -1637,10 +1828,19 @@ export default function OralHistoryEditor() {
 
                   {/* Hover actions */}
                   {!isEditing && isSelected && (
-                    <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+                    <div style={{ display: "flex", gap: 6, marginTop: 8, flexWrap: "wrap" }}>
                       {audioUrl && <SmBtn onClick={(e) => { e.stopPropagation(); playBlock(block); }}>▶ Play</SmBtn>}
                       <SmBtn onClick={(e) => { e.stopPropagation(); startEdit(block); }}>✎ Edit</SmBtn>
                       <SmBtn onClick={(e) => { e.stopPropagation(); pushUndo(); splitBlock(block.id, Math.floor(text.length / 2)); }}>Split ½</SmBtn>
+                      <SmBtn onClick={(e) => { e.stopPropagation(); splitBySentence(block.id); }}>Split sentences</SmBtn>
+                      {block.segments.length > 1 && <SmBtn onClick={(e) => { e.stopPropagation(); splitAtPause(block.id); }}>Split at pause</SmBtn>}
+                      {block.segments.length > 1 && <SmBtn onClick={(e) => { e.stopPropagation(); decomposeBlock(block.id); }}>Decompose</SmBtn>}
+                      {block.wasEdited && <SmBtn onClick={(e) => {
+                        e.stopPropagation(); pushUndo();
+                        setBlocks(prev => prev.map(b => b.id !== block.id ? b : {
+                          ...b, wasEdited: false, segments: b.segments.map(s => ({ ...s, text: s.originalText })),
+                        }));
+                      }}>Revert</SmBtn>}
                     </div>
                   )}
                 </div>
