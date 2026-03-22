@@ -2300,6 +2300,89 @@ Return ONLY valid JSON, no other text.`;
             </div>
           </div>
         )}
+
+        {/* ── Source Panel ── */}
+        {showSource && hasContent && originalSegments.length > 0 && (
+          <div style={{ width: 300, borderLeft: `1px solid ${C.border}`, background: C.surface, overflowY: "auto", display: "flex", flexDirection: "column", flexShrink: 0 }}>
+            <div style={{ padding: "14px 16px", borderBottom: `1px solid ${C.border}` }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+                <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim, letterSpacing: "0.06em", textTransform: "uppercase" }}>Source Transcript</span>
+                <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: C.textDim }}>{originalSegments.length} segments</span>
+              </div>
+              <input value={sourceSearch} onChange={(e) => setSourceSearch(e.target.value)}
+                placeholder="Search transcript..."
+                style={{ width: "100%", fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "5px 8px", background: C.raised, border: `1px solid ${C.border}`, borderRadius: 4, color: C.text }}
+              />
+              <div style={{ display: "flex", gap: 4, marginTop: 6 }}>
+                <SmBtn onClick={() => setSourceView("all")} accent={sourceView === "all"}>All</SmBtn>
+                <SmBtn onClick={() => setSourceView("unused")} accent={sourceView === "unused"}>Unused</SmBtn>
+              </div>
+            </div>
+            <div style={{ flex: 1, overflowY: "auto", padding: "6px 0" }}>
+              {(() => {
+                // Group originalSegments into ~15s chunks
+                const chunks = [];
+                let chunk = [];
+                let chunkStart = originalSegments[0]?.start || 0;
+                for (const seg of originalSegments) {
+                  chunk.push(seg);
+                  if (seg.end - chunkStart >= 15 || seg === originalSegments[originalSegments.length - 1]) {
+                    chunks.push({ segments: [...chunk], start: chunkStart, end: seg.end });
+                    chunk = [];
+                    chunkStart = seg.end;
+                  }
+                }
+                // Filter by search
+                const filtered = sourceSearch.trim()
+                  ? chunks.filter(c => c.segments.some(s => s.text.toLowerCase().includes(sourceSearch.toLowerCase())))
+                  : chunks;
+                // Filter by view
+                const usedTimes = new Set();
+                blocks.forEach(b => b.segments.forEach(s => usedTimes.add(`${s.start.toFixed(3)}-${s.end.toFixed(3)}`)));
+                const viewFiltered = sourceView === "unused"
+                  ? filtered.filter(c => !c.segments.every(s => usedTimes.has(`${s.start.toFixed(3)}-${s.end.toFixed(3)}`)))
+                  : filtered;
+
+                return viewFiltered.map((chunk, i) => {
+                  const chunkText = chunk.segments.map(s => s.text).join(" ");
+                  const isUsed = chunk.segments.every(s => usedTimes.has(`${s.start.toFixed(3)}-${s.end.toFixed(3)}`));
+                  return (
+                    <div key={i}
+                      draggable
+                      onDragStart={(e) => {
+                        e.dataTransfer.setData("application/json", JSON.stringify(chunk));
+                        e.dataTransfer.effectAllowed = "copy";
+                      }}
+                      style={{
+                        padding: "8px 16px", borderBottom: `1px solid ${C.border}`,
+                        cursor: "grab", opacity: isUsed ? 0.4 : 1,
+                        transition: "background 0.1s",
+                      }}
+                      onMouseEnter={(e) => { e.currentTarget.style.background = C.raised; }}
+                      onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}
+                    >
+                      <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: C.accent, marginBottom: 3 }}>
+                        {fmtTime(chunk.start)} — {fmtTime(chunk.end)}
+                        {isUsed && <span style={{ marginLeft: 6, color: C.textDim }}>(used)</span>}
+                      </div>
+                      <p style={{ fontFamily: "'Newsreader', Georgia, serif", fontSize: 12, lineHeight: 1.5, color: C.text, margin: 0 }}>
+                        {sourceSearch.trim() ? (
+                          chunkText.split(new RegExp(`(${sourceSearch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi')).map((part, j) =>
+                            part.toLowerCase() === sourceSearch.toLowerCase()
+                              ? <mark key={j} style={{ background: C.accentDim, color: C.accent }}>{part}</mark>
+                              : part
+                          )
+                        ) : (
+                          chunkText.length > 120 ? chunkText.slice(0, 120) + "\u2026" : chunkText
+                        )}
+                      </p>
+                    </div>
+                  );
+                });
+              })()}
+            </div>
+          </div>
+        )}
       </div>
 
       {/* ── AI Suggestions Modal ── */}
@@ -2342,8 +2425,9 @@ Return ONLY valid JSON, no other text.`;
           fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.border, display: "flex", gap: 14, flexWrap: "wrap",
         }}>
           <span>Click select</span><span>Shift range</span><span>⌘ multi</span>
-          <span>✎ edit text</span><span>Drag reorder</span>
+          <span>✎ edit text</span><span>Drag reorder</span><span>Click word to play</span>
           <span>1–9 assign speaker</span><span>0 clear</span><span>⌘Z undo</span>
+          <span>Sections organize files</span><span>Drag edges to trim</span>
         </div>
       )}
     </div>
