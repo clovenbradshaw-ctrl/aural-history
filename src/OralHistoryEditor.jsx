@@ -627,6 +627,16 @@ export default function OralHistoryEditor() {
 
   const totalDuration = useMemo(() => blocks.reduce((sum, b) => sum + blockDuration(b), 0), [blocks, blockDuration]);
 
+  const sectionedBlocks = useMemo(() => {
+    const unsectioned = blocks.map((b, i) => ({ block: b, globalIdx: i })).filter(({ block }) => !block.sectionId);
+    const grouped = sections.map(section => ({
+      ...section,
+      blocks: blocks.map((b, i) => ({ block: b, globalIdx: i })).filter(({ block }) => block.sectionId === section.id),
+      duration: blocks.filter(b => b.sectionId === section.id).reduce((sum, b) => sum + b.segments.reduce((s, seg) => s + (seg.end - seg.start), 0), 0),
+    }));
+    return { unsectioned, sections: grouped };
+  }, [blocks, sections]);
+
   const getSpeaker = useCallback((id) => speakers.find((s) => s.id === id) || null, [speakers]);
 
   // Resolve effective speaker: if a block has no explicit speaker, inherit from the nearest prior block that does
@@ -683,6 +693,45 @@ export default function OralHistoryEditor() {
     setBlocks(mergeAdjacent(updated));
     setSelected(new Set());
   }, [selected, pushUndo, blocks, mergeAdjacent]);
+
+  /* ── Section management ── */
+  const addSection = useCallback((name) => {
+    if (!name.trim()) return;
+    setSections(prev => [...prev, { id: uid(), name: name.trim(), collapsed: false }]);
+    setNewSectionName("");
+    setAddingSection(false);
+  }, []);
+
+  const removeSection = useCallback((sid) => {
+    pushUndo();
+    setSections(prev => prev.filter(s => s.id !== sid));
+    setBlocks(prev => prev.map(b => b.sectionId === sid ? { ...b, sectionId: null } : b));
+  }, [pushUndo]);
+
+  const renameSection = useCallback((sid, name) => {
+    if (!name.trim()) return;
+    setSections(prev => prev.map(s => s.id === sid ? { ...s, name: name.trim() } : s));
+    setEditingSectionId(null);
+  }, []);
+
+  const toggleSectionCollapse = useCallback((sid) => {
+    setSections(prev => prev.map(s => s.id === sid ? { ...s, collapsed: !s.collapsed } : s));
+  }, []);
+
+  /* ── Section assignment ── */
+  const assignToSection = useCallback((sectionId) => {
+    if (selected.size === 0) return;
+    pushUndo();
+    setBlocks(prev => prev.map(b => selected.has(b.id) ? { ...b, sectionId } : b));
+    setSelected(new Set());
+  }, [selected, pushUndo]);
+
+  const unsectionBlocks = useCallback(() => {
+    if (selected.size === 0) return;
+    pushUndo();
+    setBlocks(prev => prev.map(b => selected.has(b.id) ? { ...b, sectionId: null } : b));
+    setSelected(new Set());
+  }, [selected, pushUndo]);
 
   /* ── Selection ── */
   const handleSelect = useCallback((id, e) => {
@@ -843,6 +892,9 @@ export default function OralHistoryEditor() {
     const next = [...blocks];
     const [moved] = next.splice(from, 1);
     moved.wasMoved = true;
+    // Cross-section drag: adopt target block's sectionId
+    const target = next.find(b => b.id === targetId);
+    if (target) moved.sectionId = target.sectionId || null;
     next.splice(to, 0, moved);
     setBlocks(next);
     setDragging(null);
@@ -1049,31 +1101,67 @@ export default function OralHistoryEditor() {
   }, [autoSaveEnabled, webhookBase, blocks.length, cloudSave, syncStatus]);
 
   /* ── Export: Markdown ── */
-  const generateMarkdown = useCallback(() => {
+  const generateMarkdown = useCallback((sectionFilter) => {
     let md = `# ${projectTitle}\n\n`;
     if (audioName) md += `*Source: ${audioName}*\n\n---\n\n`;
-    let lastSpeakerName = null;
-    blocks.forEach((block, idx) => {
-      const spk = getEffectiveSpeaker(idx);
-      const name = spk ? spk.name : "Unknown Speaker";
-      const text = blockText(block);
-      if (name !== lastSpeakerName) {
-        md += `**${name}:** ${text}\n\n`;
-      } else {
-        md += `${text}\n\n`;
-      }
-      lastSpeakerName = name;
-    });
-    return md;
-  }, [blocks, getEffectiveSpeaker, blockText, audioName, projectTitle]);
 
-  const downloadMarkdown = useCallback(() => {
-    const blob = new Blob([generateMarkdown()], { type: "text/markdown" });
+    const renderBlocks = (blockList, blockIndices) => {
+      let out = "";
+      let lastSpeakerName = null;
+      blockList.forEach((block, i) => {
+        const idx = blockIndices ? blockIndices[i] : blocks.indexOf(block);
+        const spk = getEffectiveSpeaker(idx);
+        const name = spk ? spk.name : "Unknown Speaker";
+        const text = blockText(block);
+        if (name !== lastSpeakerName) {
+          out += `**${name}:** ${text}\n\n`;
+        } else {
+          out += `${text}\n\n`;
+        }
+        lastSpeakerName = name;
+      });
+      return out;
+    };
+
+    if (sections.length === 0 || sectionFilter) {
+      // Flat or single-section export
+      const filteredBlocks = sectionFilter
+        ? blocks.filter(b => b.sectionId === sectionFilter)
+        : blocks;
+      const filteredIndices = sectionFilter
+        ? blocks.map((b, i) => b.sectionId === sectionFilter ? i : -1).filter(i => i !== -1)
+        : null;
+      md += renderBlocks(filteredBlocks, filteredIndices);
+    } else {
+      // Section-grouped export
+      const unsectioned = blocks.filter(b => !b.sectionId);
+      if (unsectioned.length > 0) {
+        md += renderBlocks(unsectioned, unsectioned.map(b => blocks.indexOf(b)));
+        md += "---\n\n";
+      }
+      sections.forEach(section => {
+        const sBlocks = blocks.filter(b => b.sectionId === section.id);
+        if (sBlocks.length > 0) {
+          md += `## ${section.name}\n\n`;
+          md += renderBlocks(sBlocks, sBlocks.map(b => blocks.indexOf(b)));
+        }
+      });
+    }
+    return md;
+  }, [blocks, sections, getEffectiveSpeaker, blockText, audioName, projectTitle]);
+
+  const downloadMarkdown = useCallback((sectionFilter) => {
+    const md = generateMarkdown(sectionFilter);
+    const blob = new Blob([md], { type: "text/markdown" });
     const url = URL.createObjectURL(blob);
-    const fn = projectTitle.replace(/[^a-zA-Z0-9_ -]/g, "").replace(/\s+/g, "-").toLowerCase() || "oral-history";
+    let fn = projectTitle.replace(/[^a-zA-Z0-9_ -]/g, "").replace(/\s+/g, "-").toLowerCase() || "oral-history";
+    if (sectionFilter) {
+      const sec = sections.find(s => s.id === sectionFilter);
+      if (sec) fn += "-" + sec.name.replace(/[^a-zA-Z0-9_ -]/g, "").replace(/\s+/g, "-").toLowerCase();
+    }
     const a = document.createElement("a"); a.href = url; a.download = `${fn}.md`; a.click();
     URL.revokeObjectURL(url);
-  }, [generateMarkdown, projectTitle]);
+  }, [generateMarkdown, projectTitle, sections]);
 
   /* ── Export: Project JSON ── */
   const generateProject = useCallback(() => {
@@ -1233,6 +1321,7 @@ export default function OralHistoryEditor() {
           <TBtn onClick={stopPlayback} label="■ Stop" />
           <Sep />
           <TBtn onClick={() => setShowSpeakers(!showSpeakers)} label={showSpeakers ? "◂ Speakers" : "▸ Speakers"} />
+          <TBtn onClick={() => setShowTOC(!showTOC)} label={showTOC ? "◂ Sections" : "▸ Sections"} />
           <div style={{ flex: 1 }} />
           <span style={{ color: C.textDim, fontSize: 10 }}>
             {blocks.length} ¶ · {fmtTime(totalDuration)}
@@ -1244,92 +1333,205 @@ export default function OralHistoryEditor() {
 
       <div style={{ flex: 1, display: "flex", overflow: "hidden" }}>
 
-        {/* ── Speaker Panel ── */}
-        {hasContent && showSpeakers && (
+        {/* ── Left Sidebar: Sections + Speakers ── */}
+        {hasContent && (showSpeakers || showTOC) && (
           <div style={{
             width: 210, borderRight: `1px solid ${C.border}`, background: C.surface,
             display: "flex", flexDirection: "column", flexShrink: 0,
           }}>
-            <div style={{ padding: "14px 16px", borderBottom: `1px solid ${C.border}`, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-              <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim, letterSpacing: "0.06em", textTransform: "uppercase" }}>Speakers</span>
-              <button onClick={() => setAddingSpeaker(true)} style={{ fontFamily: "'DM Mono', monospace", fontSize: 15, background: "none", border: "none", color: C.accent, cursor: "pointer", padding: "0 4px", lineHeight: 1 }}>+</button>
-            </div>
+            {/* ── Sections / TOC Panel ── */}
+            {showTOC && (
+              <div style={{ display: "flex", flexDirection: "column", borderBottom: showSpeakers ? `1px solid ${C.border}` : "none", maxHeight: showSpeakers ? "50%" : "100%", overflow: "hidden" }}>
+                <div style={{ padding: "14px 16px", borderBottom: `1px solid ${C.border}`, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim, letterSpacing: "0.06em", textTransform: "uppercase" }}>Sections</span>
+                  <button onClick={() => setAddingSection(true)} style={{ fontFamily: "'DM Mono', monospace", fontSize: 15, background: "none", border: "none", color: C.accent, cursor: "pointer", padding: "0 4px", lineHeight: 1 }}>+</button>
+                </div>
+                <div style={{ flex: 1, overflowY: "auto", padding: "6px 0" }}>
+                  {/* Unsectioned count */}
+                  {sectionedBlocks.unsectioned.length > 0 && (
+                    <div
+                      onClick={() => { if (selected.size > 0) unsectionBlocks(); }}
+                      style={{
+                        padding: "5px 16px", display: "flex", alignItems: "center", gap: 7,
+                        cursor: selected.size > 0 ? "pointer" : "default",
+                        borderLeft: "3px solid transparent",
+                        background: "transparent", transition: "background 0.1s",
+                      }}
+                      onMouseEnter={(e) => { if (selected.size > 0) e.currentTarget.style.background = C.raised; }}
+                      onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}
+                    >
+                      <span style={{ flex: 1, fontFamily: "'DM Mono', monospace", fontSize: 11, color: C.textDim, fontStyle: "italic" }}>Unsectioned</span>
+                      <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: C.textDim }}>{sectionedBlocks.unsectioned.length}</span>
+                    </div>
+                  )}
 
-            <div style={{ flex: 1, overflowY: "auto", padding: "6px 0" }}>
-              {speakers.map((spk, idx) => {
-                const count = blocks.filter((_, i) => getEffectiveSpeakerId(i) === spk.id).length;
-                const isEd = editingSpeakerId === spk.id;
-                return (
-                  <div key={spk.id}
-                    onClick={() => { if (selected.size > 0 && !isEd) assignAndMerge(spk.id); else if (selected.size === 0 && !isEd) { setEditingSpeakerId(spk.id); setEditingSpeakerName(spk.name); } }}
-                    style={{
-                      padding: "5px 16px", display: "flex", alignItems: "center", gap: 7,
-                      cursor: selected.size > 0 ? "pointer" : "default",
-                      borderLeft: `3px solid ${spk.color}`,
-                      background: "transparent", transition: "background 0.1s",
-                    }}
-                    onMouseEnter={(e) => { if (selected.size > 0) e.currentTarget.style.background = C.raised; }}
-                    onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}
-                  >
-                    {isEd ? (
-                      <input ref={editSpkRef} value={editingSpeakerName}
-                        onChange={(e) => setEditingSpeakerName(e.target.value)}
-                        onKeyDown={(e) => { if (e.key === "Enter") renameSpeaker(spk.id, editingSpeakerName); if (e.key === "Escape") setEditingSpeakerId(null); }}
-                        onBlur={() => editingSpeakerName.trim() ? renameSpeaker(spk.id, editingSpeakerName) : setEditingSpeakerId(null)}
-                        style={{ flex: 1, background: C.raised, border: `1px solid ${spk.color}`, borderRadius: 3, color: C.text, fontFamily: "'DM Mono', monospace", fontSize: 12, padding: "2px 6px", minWidth: 0 }}
+                  {sectionedBlocks.sections.map((section) => {
+                    const isEd = editingSectionId === section.id;
+                    return (
+                      <div key={section.id}
+                        onClick={() => {
+                          if (selected.size > 0 && !isEd) {
+                            assignToSection(section.id);
+                          } else if (!isEd) {
+                            document.getElementById('section-' + section.id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                          }
+                        }}
+                        style={{
+                          padding: "5px 16px", display: "flex", alignItems: "center", gap: 7,
+                          cursor: "pointer",
+                          borderLeft: `3px solid ${C.accent}`,
+                          background: activeSectionId === section.id ? C.accentDim : "transparent",
+                          transition: "background 0.1s",
+                        }}
+                        onMouseEnter={(e) => { e.currentTarget.style.background = C.raised; }}
+                        onMouseLeave={(e) => { e.currentTarget.style.background = activeSectionId === section.id ? C.accentDim : "transparent"; }}
+                      >
+                        <button onClick={(e) => { e.stopPropagation(); toggleSectionCollapse(section.id); }}
+                          style={{ background: "none", border: "none", color: C.textDim, cursor: "pointer", fontSize: 10, padding: 0, lineHeight: 1 }}>
+                          {section.collapsed ? "▸" : "▾"}
+                        </button>
+                        {isEd ? (
+                          <input ref={editSectionRef} value={editingSectionName}
+                            onChange={(e) => setEditingSectionName(e.target.value)}
+                            onKeyDown={(e) => { if (e.key === "Enter") renameSection(section.id, editingSectionName); if (e.key === "Escape") setEditingSectionId(null); }}
+                            onBlur={() => editingSectionName.trim() ? renameSection(section.id, editingSectionName) : setEditingSectionId(null)}
+                            onClick={(e) => e.stopPropagation()}
+                            style={{ flex: 1, background: C.raised, border: `1px solid ${C.accent}`, borderRadius: 3, color: C.text, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "2px 6px", minWidth: 0 }}
+                          />
+                        ) : (
+                          <span onDoubleClick={(e) => { e.stopPropagation(); setEditingSectionId(section.id); setEditingSectionName(section.name); }}
+                            style={{ flex: 1, fontFamily: "'DM Mono', monospace", fontSize: 11, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                            {section.name}
+                          </span>
+                        )}
+                        <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: C.textDim, minWidth: 14, textAlign: "right" }}>{section.blocks.length}</span>
+                        {!isEd && (
+                          <button onClick={(e) => { e.stopPropagation(); removeSection(section.id); }}
+                            style={{ background: "none", border: "none", color: C.border, cursor: "pointer", fontSize: 12, padding: 0, lineHeight: 1, opacity: 0.4 }}
+                            onMouseEnter={(e) => { e.currentTarget.style.opacity = "1"; e.currentTarget.style.color = C.danger; }}
+                            onMouseLeave={(e) => { e.currentTarget.style.opacity = "0.4"; e.currentTarget.style.color = C.border; }}
+                          >×</button>
+                        )}
+                      </div>
+                    );
+                  })}
+
+                  {addingSection && (
+                    <div style={{ padding: "5px 16px", display: "flex", alignItems: "center", gap: 7, borderLeft: `3px solid ${C.accent}` }}>
+                      <input ref={newSectionRef} value={newSectionName} onChange={(e) => setNewSectionName(e.target.value)}
+                        onKeyDown={(e) => { if (e.key === "Enter") addSection(newSectionName); if (e.key === "Escape") { setAddingSection(false); setNewSectionName(""); } }}
+                        onBlur={() => newSectionName.trim() ? addSection(newSectionName) : (setAddingSection(false), setNewSectionName(""))}
+                        placeholder="Section name..." style={{ flex: 1, background: C.raised, border: `1px solid ${C.accent}`, borderRadius: 3, color: C.text, fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "2px 6px", minWidth: 0 }}
                       />
-                    ) : (
-                      <span onDoubleClick={(e) => { e.stopPropagation(); setEditingSpeakerId(spk.id); setEditingSpeakerName(spk.name); }}
-                        style={{ flex: 1, fontFamily: "'DM Mono', monospace", fontSize: 12, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                        {spk.name}
-                      </span>
-                    )}
-                    <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: C.border, minWidth: 12, textAlign: "center" }}>{idx < 9 ? idx + 1 : ""}</span>
-                    <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: C.textDim, minWidth: 14, textAlign: "right" }}>{count}</span>
-                    {!isEd && (
-                      <button onClick={(e) => { e.stopPropagation(); removeSpeaker(spk.id); }}
-                        style={{ background: "none", border: "none", color: C.border, cursor: "pointer", fontSize: 12, padding: 0, lineHeight: 1, opacity: 0.4 }}
-                        onMouseEnter={(e) => { e.currentTarget.style.opacity = "1"; e.currentTarget.style.color = C.danger; }}
-                        onMouseLeave={(e) => { e.currentTarget.style.opacity = "0.4"; e.currentTarget.style.color = C.border; }}
-                      >×</button>
-                    )}
+                    </div>
+                  )}
+
+                  {sections.length === 0 && !addingSection && (
+                    <div style={{ padding: "16px 16px", textAlign: "center" }}>
+                      <p style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim, lineHeight: 1.6 }}>Organize paragraphs<br />into sections</p>
+                      <button onClick={() => setAddingSection(true)}
+                        style={{ marginTop: 8, fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "4px 10px", background: C.accentDim, border: `1px solid ${C.accent}`, borderRadius: 4, color: C.accent, cursor: "pointer" }}>
+                        + Add section
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                {selected.size > 0 && sections.length > 0 && (
+                  <div style={{ padding: "6px 16px", borderTop: `1px solid ${C.border}`, background: C.raised }}>
+                    <p style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.accent, lineHeight: 1.4 }}>
+                      {selected.size} selected — click section to assign
+                    </p>
                   </div>
-                );
-              })}
+                )}
+              </div>
+            )}
 
-              {addingSpeaker && (
-                <div style={{ padding: "5px 16px", display: "flex", alignItems: "center", gap: 7, borderLeft: `3px solid ${SPEAKER_PALETTE[speakers.length % SPEAKER_PALETTE.length].color}` }}>
-                  <input ref={newSpkRef} value={newSpeakerName} onChange={(e) => setNewSpeakerName(e.target.value)}
-                    onKeyDown={(e) => { if (e.key === "Enter") addSpeaker(newSpeakerName); if (e.key === "Escape") { setAddingSpeaker(false); setNewSpeakerName(""); } }}
-                    onBlur={() => newSpeakerName.trim() ? addSpeaker(newSpeakerName) : (setAddingSpeaker(false), setNewSpeakerName(""))}
-                    placeholder="Name..." style={{ flex: 1, background: C.raised, border: `1px solid ${SPEAKER_PALETTE[speakers.length % SPEAKER_PALETTE.length].color}`, borderRadius: 3, color: C.text, fontFamily: "'DM Mono', monospace", fontSize: 12, padding: "2px 6px", minWidth: 0 }}
-                  />
+            {/* ── Speaker Panel ── */}
+            {showSpeakers && (
+              <div style={{ display: "flex", flexDirection: "column", flex: 1, overflow: "hidden" }}>
+                <div style={{ padding: "14px 16px", borderBottom: `1px solid ${C.border}`, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim, letterSpacing: "0.06em", textTransform: "uppercase" }}>Speakers</span>
+                  <button onClick={() => setAddingSpeaker(true)} style={{ fontFamily: "'DM Mono', monospace", fontSize: 15, background: "none", border: "none", color: C.accent, cursor: "pointer", padding: "0 4px", lineHeight: 1 }}>+</button>
                 </div>
-              )}
 
-              {speakers.length === 0 && !addingSpeaker && (
-                <div style={{ padding: "24px 16px", textAlign: "center" }}>
-                  <p style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim, lineHeight: 1.6 }}>Add speakers to tag<br />each paragraph</p>
-                  <button onClick={() => setAddingSpeaker(true)}
-                    style={{ marginTop: 8, fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "4px 10px", background: C.accentDim, border: `1px solid ${C.accent}`, borderRadius: 4, color: C.accent, cursor: "pointer" }}>
-                    + Add speaker
-                  </button>
+                <div style={{ flex: 1, overflowY: "auto", padding: "6px 0" }}>
+                  {speakers.map((spk, idx) => {
+                    const count = blocks.filter((_, i) => getEffectiveSpeakerId(i) === spk.id).length;
+                    const isEd = editingSpeakerId === spk.id;
+                    return (
+                      <div key={spk.id}
+                        onClick={() => { if (selected.size > 0 && !isEd) assignAndMerge(spk.id); else if (selected.size === 0 && !isEd) { setEditingSpeakerId(spk.id); setEditingSpeakerName(spk.name); } }}
+                        style={{
+                          padding: "5px 16px", display: "flex", alignItems: "center", gap: 7,
+                          cursor: selected.size > 0 ? "pointer" : "default",
+                          borderLeft: `3px solid ${spk.color}`,
+                          background: "transparent", transition: "background 0.1s",
+                        }}
+                        onMouseEnter={(e) => { if (selected.size > 0) e.currentTarget.style.background = C.raised; }}
+                        onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}
+                      >
+                        {isEd ? (
+                          <input ref={editSpkRef} value={editingSpeakerName}
+                            onChange={(e) => setEditingSpeakerName(e.target.value)}
+                            onKeyDown={(e) => { if (e.key === "Enter") renameSpeaker(spk.id, editingSpeakerName); if (e.key === "Escape") setEditingSpeakerId(null); }}
+                            onBlur={() => editingSpeakerName.trim() ? renameSpeaker(spk.id, editingSpeakerName) : setEditingSpeakerId(null)}
+                            style={{ flex: 1, background: C.raised, border: `1px solid ${spk.color}`, borderRadius: 3, color: C.text, fontFamily: "'DM Mono', monospace", fontSize: 12, padding: "2px 6px", minWidth: 0 }}
+                          />
+                        ) : (
+                          <span onDoubleClick={(e) => { e.stopPropagation(); setEditingSpeakerId(spk.id); setEditingSpeakerName(spk.name); }}
+                            style={{ flex: 1, fontFamily: "'DM Mono', monospace", fontSize: 12, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                            {spk.name}
+                          </span>
+                        )}
+                        <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: C.border, minWidth: 12, textAlign: "center" }}>{idx < 9 ? idx + 1 : ""}</span>
+                        <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: C.textDim, minWidth: 14, textAlign: "right" }}>{count}</span>
+                        {!isEd && (
+                          <button onClick={(e) => { e.stopPropagation(); removeSpeaker(spk.id); }}
+                            style={{ background: "none", border: "none", color: C.border, cursor: "pointer", fontSize: 12, padding: 0, lineHeight: 1, opacity: 0.4 }}
+                            onMouseEnter={(e) => { e.currentTarget.style.opacity = "1"; e.currentTarget.style.color = C.danger; }}
+                            onMouseLeave={(e) => { e.currentTarget.style.opacity = "0.4"; e.currentTarget.style.color = C.border; }}
+                          >×</button>
+                        )}
+                      </div>
+                    );
+                  })}
+
+                  {addingSpeaker && (
+                    <div style={{ padding: "5px 16px", display: "flex", alignItems: "center", gap: 7, borderLeft: `3px solid ${SPEAKER_PALETTE[speakers.length % SPEAKER_PALETTE.length].color}` }}>
+                      <input ref={newSpkRef} value={newSpeakerName} onChange={(e) => setNewSpeakerName(e.target.value)}
+                        onKeyDown={(e) => { if (e.key === "Enter") addSpeaker(newSpeakerName); if (e.key === "Escape") { setAddingSpeaker(false); setNewSpeakerName(""); } }}
+                        onBlur={() => newSpeakerName.trim() ? addSpeaker(newSpeakerName) : (setAddingSpeaker(false), setNewSpeakerName(""))}
+                        placeholder="Name..." style={{ flex: 1, background: C.raised, border: `1px solid ${SPEAKER_PALETTE[speakers.length % SPEAKER_PALETTE.length].color}`, borderRadius: 3, color: C.text, fontFamily: "'DM Mono', monospace", fontSize: 12, padding: "2px 6px", minWidth: 0 }}
+                      />
+                    </div>
+                  )}
+
+                  {speakers.length === 0 && !addingSpeaker && (
+                    <div style={{ padding: "24px 16px", textAlign: "center" }}>
+                      <p style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim, lineHeight: 1.6 }}>Add speakers to tag<br />each paragraph</p>
+                      <button onClick={() => setAddingSpeaker(true)}
+                        style={{ marginTop: 8, fontFamily: "'DM Mono', monospace", fontSize: 10, padding: "4px 10px", background: C.accentDim, border: `1px solid ${C.accent}`, borderRadius: 4, color: C.accent, cursor: "pointer" }}>
+                        + Add speaker
+                      </button>
+                    </div>
+                  )}
                 </div>
-              )}
-            </div>
 
-            {selected.size > 0 && speakers.length > 0 && (
-              <div style={{ padding: "8px 16px", borderTop: `1px solid ${C.border}`, background: C.raised }}>
-                <p style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.accent, lineHeight: 1.4 }}>
-                  {selected.size} selected — press 1–{Math.min(speakers.length, 9)} or click
-                </p>
+                {selected.size > 0 && speakers.length > 0 && (
+                  <div style={{ padding: "8px 16px", borderTop: `1px solid ${C.border}`, background: C.raised }}>
+                    <p style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.accent, lineHeight: 1.4 }}>
+                      {selected.size} selected — press 1–{Math.min(speakers.length, 9)} or click
+                    </p>
+                  </div>
+                )}
               </div>
             )}
           </div>
         )}
 
         {/* ── Main Content: Paragraph View ── */}
-        <div style={{ flex: 1, overflowY: "auto", padding: "32px 48px 100px", maxWidth: 800, margin: "0 auto", width: "100%" }}>
+        <div ref={editorContentRef} style={{ flex: 1, overflowY: "auto", padding: "32px 48px 100px", maxWidth: 800, margin: "0 auto", width: "100%" }}>
           {!hasContent && (
             <div style={{ textAlign: "center", padding: "80px 20px" }}>
               <p style={{ fontFamily: "'Instrument Serif', serif", fontSize: 32, color: C.text, marginBottom: 12 }}>Begin an oral history</p>
@@ -1348,102 +1550,157 @@ export default function OralHistoryEditor() {
             </div>
           )}
 
-          {blocks.map((block, idx) => {
-            const isSelected = selected.has(block.id);
-            const isEditing = editingId === block.id;
-            const isPlaying = playing === block.id;
-            const isDragTarget = dragOver === block.id && dragging !== block.id;
-            const spk = getEffectiveSpeaker(idx);
-            const isInherited = !block.speaker && spk;
-            const text = blockText(block);
-            const duration = blockDuration(block);
+          {/* ── Section-grouped block rendering ── */}
+          {hasContent && (() => {
+            const renderBlock = (block, idx) => {
+              const isSelected = selected.has(block.id);
+              const isEditing = editingId === block.id;
+              const isPlaying = playing === block.id;
+              const isDragTarget = dragOver === block.id && dragging !== block.id;
+              const spk = getEffectiveSpeaker(idx);
+              const isInherited = !block.speaker && spk;
+              const text = blockText(block);
 
-            return (
-              <div
-                key={block.id}
-                onClick={(e) => handleSelect(block.id, e)}
-                draggable={!isEditing}
-                onDragStart={() => setDragging(block.id)}
-                onDragOver={(e) => { e.preventDefault(); setDragOver(block.id); }}
-                onDrop={() => handleDrop(block.id)}
-                onDragEnd={() => { setDragging(null); setDragOver(null); }}
-                style={{
-                  marginBottom: spk ? 16 : 4,
-                  padding: "10px 20px",
-                  borderRadius: 6,
-                  background: isSelected ? C.selected : "transparent",
-                  border: `1px solid ${isDragTarget ? C.accent : isSelected ? C.selectedBorder : "transparent"}`,
-                  borderLeft: `3px solid ${spk ? spk.color : "transparent"}`,
-                  cursor: "pointer",
-                  transition: "all 0.12s ease",
-                  animation: "fadeIn 0.2s ease",
-                  position: "relative",
-                }}
-              >
-                {/* Speaker name + timestamp */}
-                <div style={{ display: "flex", alignItems: "baseline", gap: 12, marginBottom: 6 }}>
-                  {spk ? (
-                    <span style={{
-                      fontFamily: "'DM Mono', monospace", fontSize: 12, fontWeight: 500,
-                      color: spk.color, letterSpacing: "0.02em",
-                      opacity: isInherited ? 0.45 : 1,
-                    }}>
-                      {spk.name}{isInherited ? " (cont.)" : ""}
+              return (
+                <div
+                  key={block.id}
+                  onClick={(e) => handleSelect(block.id, e)}
+                  draggable={!isEditing}
+                  onDragStart={() => setDragging(block.id)}
+                  onDragOver={(e) => { e.preventDefault(); setDragOver(block.id); }}
+                  onDrop={() => handleDrop(block.id)}
+                  onDragEnd={() => { setDragging(null); setDragOver(null); }}
+                  style={{
+                    marginBottom: spk ? 16 : 4,
+                    padding: "10px 20px",
+                    borderRadius: 6,
+                    background: isSelected ? C.selected : "transparent",
+                    border: `1px solid ${isDragTarget ? C.accent : isSelected ? C.selectedBorder : "transparent"}`,
+                    borderLeft: `3px solid ${spk ? spk.color : "transparent"}`,
+                    cursor: "pointer",
+                    transition: "all 0.12s ease",
+                    animation: "fadeIn 0.2s ease",
+                    position: "relative",
+                  }}
+                >
+                  {/* Speaker name + timestamp */}
+                  <div style={{ display: "flex", alignItems: "baseline", gap: 12, marginBottom: 6 }}>
+                    {spk ? (
+                      <span style={{
+                        fontFamily: "'DM Mono', monospace", fontSize: 12, fontWeight: 500,
+                        color: spk.color, letterSpacing: "0.02em",
+                        opacity: isInherited ? 0.45 : 1,
+                      }}>
+                        {spk.name}{isInherited ? " (cont.)" : ""}
+                      </span>
+                    ) : null}
+                    <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim }}>
+                      {fmtTime(blockStart(block))} — {fmtTime(blockEnd(block))}
                     </span>
-                  ) : null}
-                  <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim }}>
-                    {fmtTime(blockStart(block))} — {fmtTime(blockEnd(block))}
-                  </span>
-                  {isPlaying && <span style={{ color: C.accent, animation: "pulse 1s infinite", fontSize: 12 }}>▶</span>}
-                  {(block.wasEdited || block.wasMoved) && (
-                    <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: C.textDim, opacity: 0.6 }}>
-                      {[block.wasEdited && "edited", block.wasMoved && "moved"].filter(Boolean).join(" · ")}
-                    </span>
+                    {isPlaying && <span style={{ color: C.accent, animation: "pulse 1s infinite", fontSize: 12 }}>▶</span>}
+                    {(block.wasEdited || block.wasMoved) && (
+                      <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: C.textDim, opacity: 0.6 }}>
+                        {[block.wasEdited && "edited", block.wasMoved && "moved"].filter(Boolean).join(" · ")}
+                      </span>
+                    )}
+                  </div>
+
+                  {/* Paragraph text */}
+                  {isEditing ? (
+                    <div>
+                      <textarea
+                        autoFocus value={editText} onChange={(e) => setEditText(e.target.value)}
+                        onKeyDown={(e) => { if (e.key === "Escape") cancelEdit(); }}
+                        style={{
+                          width: "100%", background: C.surface, border: `1px solid ${C.accent}`, borderRadius: 4,
+                          color: C.text, fontFamily: "'Newsreader', Georgia, serif", fontSize: 17, lineHeight: 1.75,
+                          padding: "12px 14px", resize: "vertical", minHeight: 80,
+                        }}
+                      />
+                      <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                        <SmBtn onClick={commitEdit} accent>Save</SmBtn>
+                        <SmBtn onClick={() => {
+                          const ta = document.querySelector("textarea:focus");
+                          if (ta && ta.selectionStart > 0 && ta.selectionStart < editText.length) {
+                            cancelEdit();
+                            splitBlock(block.id, ta.selectionStart);
+                          }
+                        }}>Split at cursor</SmBtn>
+                        <SmBtn onClick={cancelEdit}>Cancel</SmBtn>
+                      </div>
+                    </div>
+                  ) : (
+                    <p style={{ fontSize: 17, lineHeight: 1.75, margin: 0, color: C.text }}>
+                      {text}
+                    </p>
+                  )}
+
+                  {/* Hover actions */}
+                  {!isEditing && isSelected && (
+                    <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+                      {audioUrl && <SmBtn onClick={(e) => { e.stopPropagation(); playBlock(block); }}>▶ Play</SmBtn>}
+                      <SmBtn onClick={(e) => { e.stopPropagation(); startEdit(block); }}>✎ Edit</SmBtn>
+                      <SmBtn onClick={(e) => { e.stopPropagation(); pushUndo(); splitBlock(block.id, Math.floor(text.length / 2)); }}>Split ½</SmBtn>
+                    </div>
                   )}
                 </div>
+              );
+            };
 
-                {/* Paragraph text */}
-                {isEditing ? (
-                  <div>
-                    <textarea
-                      autoFocus value={editText} onChange={(e) => setEditText(e.target.value)}
-                      onKeyDown={(e) => { if (e.key === "Escape") cancelEdit(); }}
-                      style={{
-                        width: "100%", background: C.surface, border: `1px solid ${C.accent}`, borderRadius: 4,
-                        color: C.text, fontFamily: "'Newsreader', Georgia, serif", fontSize: 17, lineHeight: 1.75,
-                        padding: "12px 14px", resize: "vertical", minHeight: 80,
-                      }}
-                    />
-                    <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-                      <SmBtn onClick={commitEdit} accent>Save</SmBtn>
-                      <SmBtn onClick={() => {
-                        // Split at cursor position
-                        const ta = document.querySelector("textarea:focus");
-                        if (ta && ta.selectionStart > 0 && ta.selectionStart < editText.length) {
-                          cancelEdit();
-                          splitBlock(block.id, ta.selectionStart);
-                        }
-                      }}>Split at cursor</SmBtn>
-                      <SmBtn onClick={cancelEdit}>Cancel</SmBtn>
+            // If no sections exist, render all blocks flat (original behavior)
+            if (sections.length === 0) {
+              return blocks.map((block, idx) => renderBlock(block, idx));
+            }
+
+            // Section-grouped rendering
+            return (
+              <>
+                {/* Unsectioned blocks */}
+                {sectionedBlocks.unsectioned.length > 0 && (
+                  <div style={{ marginBottom: 24 }}>
+                    <div style={{
+                      fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim,
+                      letterSpacing: "0.06em", textTransform: "uppercase", padding: "8px 0",
+                      borderBottom: `1px solid ${C.border}`, marginBottom: 12,
+                    }}>
+                      Unsectioned
                     </div>
+                    {sectionedBlocks.unsectioned.map(({ block, globalIdx }) => renderBlock(block, globalIdx))}
                   </div>
-                ) : (
-                  <p style={{ fontSize: 17, lineHeight: 1.75, margin: 0, color: C.text }}>
-                    {text}
-                  </p>
                 )}
 
-                {/* Hover actions */}
-                {!isEditing && isSelected && (
-                  <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
-                    {audioUrl && <SmBtn onClick={(e) => { e.stopPropagation(); playBlock(block); }}>▶ Play</SmBtn>}
-                    <SmBtn onClick={(e) => { e.stopPropagation(); startEdit(block); }}>✎ Edit</SmBtn>
-                    <SmBtn onClick={(e) => { e.stopPropagation(); pushUndo(); splitBlock(block.id, Math.floor(text.length / 2)); }}>Split ½</SmBtn>
+                {/* Sectioned blocks */}
+                {sectionedBlocks.sections.map((section) => (
+                  <div key={section.id} id={`section-${section.id}`} style={{ marginBottom: 28 }}>
+                    <div
+                      onClick={() => toggleSectionCollapse(section.id)}
+                      style={{
+                        display: "flex", alignItems: "center", gap: 10, padding: "10px 0",
+                        borderBottom: `2px solid ${C.accent}`, marginBottom: 14, cursor: "pointer",
+                      }}
+                    >
+                      <span style={{ fontSize: 12, color: C.textDim }}>{section.collapsed ? "▸" : "▾"}</span>
+                      <h2 style={{
+                        fontFamily: "'Instrument Serif', serif", fontSize: 22, fontWeight: 400,
+                        color: C.text, margin: 0, flex: 1,
+                      }}>
+                        {section.name}
+                      </h2>
+                      <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim }}>
+                        {section.blocks.length} ¶ · {fmtTime(section.duration)}
+                      </span>
+                    </div>
+                    {!section.collapsed && section.blocks.map(({ block, globalIdx }) => renderBlock(block, globalIdx))}
+                    {section.collapsed && section.blocks.length > 0 && (
+                      <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim, padding: "8px 20px", fontStyle: "italic" }}>
+                        {section.blocks.length} paragraphs hidden
+                      </div>
+                    )}
                   </div>
-                )}
-              </div>
+                ))}
+              </>
             );
-          })}
+          })()}
         </div>
 
         {/* ── Export Panel ── */}
@@ -1455,9 +1712,26 @@ export default function OralHistoryEditor() {
                 {blocks.length} paragraphs · {fmtTime(totalDuration)} · {speakers.length} speakers
               </p>
               <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap" }}>
-                <SmBtn onClick={downloadMarkdown} accent>↓ Markdown (.md)</SmBtn>
+                <SmBtn onClick={() => downloadMarkdown()} accent>↓ Markdown (.md)</SmBtn>
                 <SmBtn onClick={downloadProject} accent>↓ Project (.json)</SmBtn>
               </div>
+              {sections.length > 0 && (
+                <div style={{ marginTop: 12 }}>
+                  <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim, marginBottom: 6, letterSpacing: "0.04em" }}>
+                    PER-SECTION EXPORT
+                  </div>
+                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                    {sections.map(section => {
+                      const count = blocks.filter(b => b.sectionId === section.id).length;
+                      return (
+                        <SmBtn key={section.id} onClick={() => downloadMarkdown(section.id)} disabled={count === 0}>
+                          ↓ {section.name} ({count})
+                        </SmBtn>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* MD Preview */}
