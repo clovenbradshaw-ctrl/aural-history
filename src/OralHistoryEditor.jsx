@@ -270,8 +270,10 @@ function mergeAdjacentBlocks(blockList) {
   const result = [{ ...blockList[0], segments: [...blockList[0].segments] }];
   let resultEff = [eff[0]];
   for (let i = 1; i < blockList.length; i++) {
-    // Never merge header blocks
-    if (blockList[i].type === "header" || result[result.length - 1].type === "header") {
+    // Never merge header blocks or blocks from different sources
+    const prevSrc = result[result.length - 1].segments[0]?.sourceId;
+    const currSrc = blockList[i].segments[0]?.sourceId;
+    if (blockList[i].type === "header" || result[result.length - 1].type === "header" || (prevSrc && currSrc && prevSrc !== currSrc)) {
       result.push({ ...blockList[i], segments: [...blockList[i].segments] });
       resultEff.push(eff[i]);
       continue;
@@ -308,9 +310,6 @@ function mergeAdjacentBlocks(blockList) {
 
 export default function OralHistoryEditor() {
   const [blocks, setBlocks] = useState([]);
-  const [audioUrl, setAudioUrl] = useState(null);
-  const [audioName, setAudioName] = useState("");
-  const [subName, setSubName] = useState("");
   const [selected, setSelected] = useState(new Set());
   const [clipboard, setClipboard] = useState([]);
   const [editingId, setEditingId] = useState(null);
@@ -355,8 +354,22 @@ export default function OralHistoryEditor() {
   const [editingSectionId, setEditingSectionId] = useState(null);
   const [editingSectionName, setEditingSectionName] = useState("");
 
-  // Original segments pool (for search/trim features)
-  const [originalSegments, setOriginalSegments] = useState([]);
+  // Multi-source workbook
+  const [sources, setSources] = useState([]); // [{ id, name, audioUrl, audioFile, segments, duration }]
+  const [sourceFilter, setSourceFilter] = useState("all"); // "all" | sourceId
+
+  // Multi-file workbook (tabs)
+  const defaultFileId = useRef(uid());
+  const [files, setFiles] = useState([{ id: defaultFileId.current, name: "Main" }]);
+  const [activeFileId, setActiveFileId] = useState(defaultFileId.current);
+  const [fileStates, setFileStates] = useState({}); // { [fileId]: { blocks, speakers, sections, undoStack, selected } }
+  const [editingFileName, setEditingFileName] = useState(null); // fileId being renamed
+  const [editingFileNameText, setEditingFileNameText] = useState("");
+
+  // Derived from sources (backwards compat)
+  const originalSegments = useMemo(() => sources.flatMap(s => s.segments), [sources]);
+  const audioName = useMemo(() => sources.map(s => s.name).filter(Boolean).join(", "), [sources]);
+  const hasAudio = sources.some(s => s.audioUrl);
 
   // AI provider
   const [aiProvider, setAiProvider] = useState("anthropic");
@@ -383,9 +396,9 @@ export default function OralHistoryEditor() {
   const [playingSegId, setPlayingSegId] = useState(null);
   const [currentTime, setCurrentTime] = useState(0);
   const [audioDuration, setAudioDuration] = useState(0);
+  const [activeSourceId, setActiveSourceId] = useState(null); // which source the scrub bar tracks
 
-  const audioRef = useRef(null);
-  const audioFileRef = useRef(null);
+  const audioMapRef = useRef({}); // { [sourceId]: Audio instance }
   const playTimerRef = useRef(null);
   const newSpkRef = useRef(null);
   const editSpkRef = useRef(null);
@@ -394,20 +407,129 @@ export default function OralHistoryEditor() {
   const newSectionRef = useRef(null);
   const editSectionRef = useRef(null);
   const editorContentRef = useRef(null);
+  const fileNameInputRef = useRef(null);
+
+  // Helper to get audio element for a source
+  const getAudio = useCallback((sourceId) => audioMapRef.current[sourceId] || null, []);
+
+  // File tab management
+  const switchToFile = useCallback((targetId) => {
+    if (targetId === activeFileId) return;
+    // Shelve current file state
+    setFileStates(prev => ({
+      ...prev,
+      [activeFileId]: { blocks, speakers, sections, undoStack, selected: [...selected] },
+    }));
+    // Restore target file state
+    const target = fileStates[targetId];
+    if (target) {
+      setBlocks(target.blocks || []);
+      setSpeakers(target.speakers || []);
+      setSections(target.sections || []);
+      setUndoStack(target.undoStack || []);
+      setSelected(new Set(target.selected || []));
+    } else {
+      setBlocks([]);
+      setSpeakers([]);
+      setSections([]);
+      setUndoStack([]);
+      setSelected(new Set());
+    }
+    setActiveFileId(targetId);
+    setEditingId(null);
+    setEditText("");
+  }, [activeFileId, blocks, speakers, sections, undoStack, selected, fileStates]);
+
+  const createNewFile = useCallback(() => {
+    // Shelve current file state first
+    setFileStates(prev => ({
+      ...prev,
+      [activeFileId]: { blocks, speakers, sections, undoStack, selected: [...selected] },
+    }));
+    const newId = uid();
+    setFiles(prev => [...prev, { id: newId, name: `File ${prev.length + 1}` }]);
+    setBlocks([]);
+    setSpeakers([]);
+    setSections([]);
+    setUndoStack([]);
+    setSelected(new Set());
+    setActiveFileId(newId);
+    setEditingId(null);
+  }, [activeFileId, blocks, speakers, sections, undoStack, selected]);
+
+  const deleteFile = useCallback((fileId) => {
+    if (files.length <= 1) return; // must have at least one file
+    const remaining = files.filter(f => f.id !== fileId);
+    setFiles(remaining);
+    setFileStates(prev => { const n = { ...prev }; delete n[fileId]; return n; });
+    if (fileId === activeFileId) {
+      const target = remaining[0];
+      const targetState = fileStates[target.id];
+      if (targetState) {
+        setBlocks(targetState.blocks || []);
+        setSpeakers(targetState.speakers || []);
+        setSections(targetState.sections || []);
+        setUndoStack(targetState.undoStack || []);
+        setSelected(new Set(targetState.selected || []));
+      } else {
+        setBlocks([]);
+        setSpeakers([]);
+        setSections([]);
+        setUndoStack([]);
+        setSelected(new Set());
+      }
+      setActiveFileId(target.id);
+    }
+  }, [files, activeFileId, fileStates]);
+
+  const renameFile = useCallback((fileId, newName) => {
+    if (!newName.trim()) return;
+    setFiles(prev => prev.map(f => f.id === fileId ? { ...f, name: newName.trim() } : f));
+    setEditingFileName(null);
+  }, []);
+
+  // Get all file states merged (active + shelved) for serialization
+  const getAllFileStates = useCallback(() => {
+    const currentFileState = {
+      id: activeFileId,
+      name: files.find(f => f.id === activeFileId)?.name || "Main",
+      blocks, speakers, sections,
+    };
+    return files.map(f => {
+      if (f.id === activeFileId) return currentFileState;
+      const shelved = fileStates[f.id];
+      return {
+        id: f.id,
+        name: f.name,
+        blocks: shelved?.blocks || [],
+        speakers: shelved?.speakers || [],
+        sections: shelved?.sections || [],
+      };
+    });
+  }, [activeFileId, files, blocks, speakers, sections, fileStates]);
 
   /* ── File handling ── */
   const handleAudioUpload = (e) => {
     const f = e.target.files?.[0];
     if (!f) return;
-    audioFileRef.current = f;
-    setAudioName(f.name);
+    const sourceId = uid();
     const url = URL.createObjectURL(f);
-    setAudioUrl(url);
-    if (audioRef.current) audioRef.current.src = url;
+    const audio = new Audio(url);
+    audioMapRef.current[sourceId] = audio;
+    setSources(prev => [...prev, { id: sourceId, name: f.name, audioUrl: url, audioFile: f, segments: [], duration: 0 }]);
+    setActiveSourceId(sourceId);
+    // Update duration once loaded
+    audio.addEventListener("loadedmetadata", () => {
+      setSources(prev => prev.map(s => s.id === sourceId ? { ...s, duration: audio.duration || 0 } : s));
+    });
+    e.target.value = "";
   };
 
-  const transcribeAudio = async (resume = false) => {
-    if (!audioFileRef.current) {
+  const transcribeAudio = async (resume = false, targetSourceId = null) => {
+    // Find the source to transcribe
+    const srcId = targetSourceId || activeSourceId || sources[sources.length - 1]?.id;
+    const source = sources.find(s => s.id === srcId);
+    if (!source || !source.audioFile) {
       setSyncStatus("error"); setSyncMsg("Upload an audio file first");
       setTimeout(() => setSyncStatus(null), 3000); return;
     }
@@ -433,7 +555,7 @@ export default function OralHistoryEditor() {
 
     try {
       // Split audio into chunks
-      const chunks = await sliceAudioFile(audioFileRef.current, null, setSyncMsg);
+      const chunks = await sliceAudioFile(source.audioFile, null, setSyncMsg);
       const totalChunks = chunks.length;
 
       // Determine where to resume from
@@ -487,6 +609,7 @@ export default function OralHistoryEditor() {
           start: seg.start + chunk.startOffset,
           end: seg.end + chunk.startOffset,
           originalIndex: allSegs.length + j,
+          sourceId: srcId,
         }));
 
         allSegs = [...allSegs, ...chunkSegs];
@@ -501,8 +624,8 @@ export default function OralHistoryEditor() {
       }
 
       if (allSegs.length === 0) throw new Error("No segments returned");
-      setOriginalSegments(allSegs.map(s => ({...s})));
-      setSubName("(transcribed)");
+      // Store segments in the source
+      setSources(prev => prev.map(s => s.id === srcId ? { ...s, segments: allSegs.map(seg => ({...seg})) } : s));
       setTranscriptionProgress(null);
       clearInterval(timer);
       setSyncStatus("loaded"); setSyncMsg(`Transcribed ${allSegs.length} segments in ${elapsed()}`);
@@ -525,21 +648,22 @@ export default function OralHistoryEditor() {
   const handleSubUpload = (e) => {
     const f = e.target.files?.[0];
     if (!f) return;
-    setSubName(f.name);
     const reader = new FileReader();
     reader.onload = (ev) => {
       // Handle JSON project files as transcript imports
       if (f.name.endsWith(".json")) {
         try {
           const proj = JSON.parse(ev.target.result);
-          if (proj.blocks && Array.isArray(proj.blocks)) {
+          if (proj.version === 3 || (proj.blocks && Array.isArray(proj.blocks))) {
             restoreProject(proj);
             return;
           }
         } catch (err) { /* not valid JSON, fall through to subtitle parsing */ }
       }
-      const segments = detectAndParse(ev.target.result);
-      setOriginalSegments(segments.map(s => ({...s})));
+      const sourceId = uid();
+      const segments = detectAndParse(ev.target.result).map(s => ({ ...s, sourceId }));
+      // Create a source entry for this subtitle import (no audio)
+      setSources(prev => [...prev, { id: sourceId, name: f.name, audioUrl: null, audioFile: null, segments: segments.map(s => ({...s})), duration: 0 }]);
       const newBlocks = segments.map((seg) => ({
         id: uid(),
         speaker: null,
@@ -553,6 +677,7 @@ export default function OralHistoryEditor() {
       setUndoStack([]);
     };
     reader.readAsText(f);
+    e.target.value = "";
   };
 
   /* ── Load project from JSON file ── */
@@ -575,7 +700,81 @@ export default function OralHistoryEditor() {
   };
 
   const restoreProject = (proj) => {
+    // v3 workbook format
+    if (proj.version === 3 && proj.files) {
+      // Restore sources
+      const restoredSources = (proj.sources || []).map(s => ({
+        id: s.id || uid(),
+        name: s.name || "source",
+        audioUrl: null, audioFile: null,
+        segments: (s.segments || []).map(seg => ({
+          id: uid(), text: seg.text, originalText: seg.originalText || seg.text,
+          start: seg.sourceStart ?? seg.start, end: seg.sourceEnd ?? seg.end,
+          originalIndex: seg.originalIndex || 0, sourceId: s.id,
+        })),
+        duration: s.duration || 0,
+      }));
+      setSources(restoredSources);
+
+      // Restore files
+      const restoredFiles = proj.files.map(f => ({ id: f.id || uid(), name: f.name || "Untitled" }));
+      setFiles(restoredFiles.length > 0 ? restoredFiles : [{ id: uid(), name: "Main" }]);
+
+      // Restore first file as active
+      const firstFile = proj.files[0];
+      if (firstFile) {
+        const restoreFileState = (fileData) => {
+          const fileSpeakers = (fileData.speakers || []).map(s => ({
+            id: s.id || uid(), name: s.name,
+            color: s.color || SPEAKER_PALETTE[0].color,
+            bg: SPEAKER_PALETTE.find(p => p.color === s.color)?.bg || SPEAKER_PALETTE[0].bg,
+          }));
+          const spkNameToId = {};
+          (fileData.speakers || []).forEach(s => { spkNameToId[s.name] = s.id || uid(); });
+          const fileBlocks = (fileData.blocks || []).map(b => ({
+            id: uid(),
+            speaker: b.speakerId || (b.speaker ? spkNameToId[b.speaker] : null) || null,
+            wasMoved: b.wasMoved || false, wasEdited: b.wasEdited || false,
+            sectionId: b.sectionId || null,
+            ...(b.type === "header" ? { type: "header", text: b.headerText || b.text || "", level: b.level || 2, segments: [] } : {}),
+            segments: (b.type === "header") ? [] : (b.segments || []).map(seg => ({
+              id: uid(), text: seg.text, originalText: seg.originalText || seg.text,
+              start: seg.sourceStart ?? seg.start, end: seg.sourceEnd ?? seg.end,
+              originalIndex: seg.originalIndex || 0, sourceId: seg.sourceId || restoredSources[0]?.id || null,
+            })),
+          }));
+          const fileSections = (fileData.sections || []).map(s => ({ id: s.id || uid(), name: s.name, collapsed: false }));
+          return { blocks: mergeAdjacentBlocks(fileBlocks), speakers: fileSpeakers, sections: fileSections };
+        };
+
+        // Set active file
+        const activeState = restoreFileState(firstFile);
+        setBlocks(activeState.blocks);
+        setSpeakers(activeState.speakers);
+        setSections(activeState.sections);
+        setActiveFileId(restoredFiles[0].id);
+
+        // Shelve remaining files
+        const shelved = {};
+        proj.files.slice(1).forEach((f, i) => {
+          const state = restoreFileState(f);
+          shelved[restoredFiles[i + 1].id] = { ...state, undoStack: [], selected: [] };
+        });
+        setFileStates(shelved);
+      }
+
+      if (proj.title) setProjectTitle(proj.title);
+      setSelected(new Set());
+      setUndoStack([]);
+      setSyncStatus("loaded");
+      setSyncMsg("Workbook loaded");
+      setTimeout(() => setSyncStatus(null), 2000);
+      return;
+    }
+
+    // v2 legacy format — migrate
     if (!proj.blocks || !Array.isArray(proj.blocks)) return;
+    const sourceId = uid();
     if (proj.speakers && Array.isArray(proj.speakers)) {
       setSpeakers(proj.speakers.map((s) => ({
         id: s.id || uid(),
@@ -603,10 +802,17 @@ export default function OralHistoryEditor() {
         start: seg.sourceStart,
         end: seg.sourceEnd,
         originalIndex: seg.originalIndex || 0,
+        sourceId,
       })),
     }));
     setBlocks(mergeAdjacentBlocks(restored));
-    if (proj.sourceFile) setAudioName(proj.sourceFile);
+    // Create a source entry for the v2 project
+    setSources([{ id: sourceId, name: proj.sourceFile || "source.wav", audioUrl: null, audioFile: null, segments: [], duration: proj.totalDuration || 0 }]);
+    // Reset to single file
+    const fileId = uid();
+    setFiles([{ id: fileId, name: proj.title || "Main" }]);
+    setActiveFileId(fileId);
+    setFileStates({});
     if (proj.title) setProjectTitle(proj.title);
     setSelected(new Set());
     setUndoStack([]);
@@ -1028,17 +1234,29 @@ export default function OralHistoryEditor() {
   }, [dragging, blocks, pushUndo]);
 
   /* ── Playback ── */
+  const playSegAudio = useCallback((seg) => {
+    const audio = getAudio(seg.sourceId);
+    if (!audio) return null;
+    // Pause any other source that might be playing
+    Object.entries(audioMapRef.current).forEach(([id, a]) => {
+      if (id !== seg.sourceId && !a.paused) a.pause();
+    });
+    audio.currentTime = seg.start;
+    audio.play();
+    setActiveSourceId(seg.sourceId);
+    return audio;
+  }, [getAudio]);
+
   const playBlock = useCallback((block) => {
-    if (!audioRef.current || !audioUrl) return;
+    if (!hasAudio) return;
     clearInterval(playTimerRef.current);
     const segs = [...block.segments].sort((a, b) => a.start - b.start);
     let idx = 0;
     const playNext = () => {
       if (idx >= segs.length) { setPlaying(null); return; }
       const seg = segs[idx];
-      const a = audioRef.current;
-      a.currentTime = seg.start;
-      a.play();
+      const a = playSegAudio(seg);
+      if (!a) { idx++; playNext(); return; }
       setPlaying(block.id);
       playTimerRef.current = setInterval(() => {
         if (a.currentTime >= seg.end) {
@@ -1049,10 +1267,10 @@ export default function OralHistoryEditor() {
       }, 50);
     };
     playNext();
-  }, [audioUrl]);
+  }, [hasAudio, playSegAudio]);
 
   const playAll = useCallback(() => {
-    if (!audioRef.current || !audioUrl || blocks.length === 0) return;
+    if (!hasAudio || blocks.length === 0) return;
     let bIdx = 0;
     const playNextBlock = () => {
       if (bIdx >= blocks.length) { setPlaying(null); return; }
@@ -1062,12 +1280,12 @@ export default function OralHistoryEditor() {
       const playNextSeg = () => {
         if (sIdx >= segs.length) { bIdx++; playNextBlock(); return; }
         const seg = segs[sIdx];
-        audioRef.current.currentTime = seg.start;
-        audioRef.current.play();
+        const a = playSegAudio(seg);
+        if (!a) { sIdx++; playNextSeg(); return; }
         setPlaying(block.id);
         clearInterval(playTimerRef.current);
         playTimerRef.current = setInterval(() => {
-          if (audioRef.current.currentTime >= seg.end) {
+          if (a.currentTime >= seg.end) {
             clearInterval(playTimerRef.current);
             sIdx++;
             playNextSeg();
@@ -1077,21 +1295,24 @@ export default function OralHistoryEditor() {
       playNextSeg();
     };
     playNextBlock();
-  }, [audioUrl, blocks]);
+  }, [hasAudio, blocks, playSegAudio]);
 
   const stopPlayback = () => {
     clearInterval(playTimerRef.current);
-    audioRef.current?.pause();
+    Object.values(audioMapRef.current).forEach(a => a.pause());
     setPlaying(null);
   };
 
-  // Audio time tracking for scrub bar
+  // Audio time tracking for scrub bar — track the active source
   useEffect(() => {
-    const audio = audioRef.current;
+    const audio = activeSourceId ? audioMapRef.current[activeSourceId] : null;
     if (!audio) return;
     const onTimeUpdate = () => setCurrentTime(audio.currentTime);
     const onLoadedMetadata = () => setAudioDuration(audio.duration || 0);
     const onDurationChange = () => setAudioDuration(audio.duration || 0);
+    // Set initial values
+    setAudioDuration(audio.duration || 0);
+    setCurrentTime(audio.currentTime || 0);
     audio.addEventListener("timeupdate", onTimeUpdate);
     audio.addEventListener("loadedmetadata", onLoadedMetadata);
     audio.addEventListener("durationchange", onDurationChange);
@@ -1100,7 +1321,7 @@ export default function OralHistoryEditor() {
       audio.removeEventListener("loadedmetadata", onLoadedMetadata);
       audio.removeEventListener("durationchange", onDurationChange);
     };
-  }, []);
+  }, [activeSourceId]);
 
   /* ── Keyboard ── */
   useEffect(() => {
@@ -1163,8 +1384,10 @@ export default function OralHistoryEditor() {
             // Expanding start backward: extend first segment
             const expanded = [...sorted];
             expanded[0] = { ...expanded[0], start: newStart };
-            // Try to pull in original segments
-            const origBefore = originalSegments.filter(s => s.end > newStart && s.end <= sorted[0].start);
+            // Try to pull in original segments from the same source
+            const blockSrcId = sorted[0]?.sourceId;
+            const srcSegs = blockSrcId ? (sources.find(s => s.id === blockSrcId)?.segments || originalSegments) : originalSegments;
+            const origBefore = srcSegs.filter(s => s.end > newStart && s.end <= sorted[0].start);
             const newSegs = origBefore.map(s => ({ ...s, id: uid() }));
             return { ...b, segments: [...newSegs, ...expanded], wasEdited: true };
           }
@@ -1180,8 +1403,10 @@ export default function OralHistoryEditor() {
             // Expanding end forward: extend last segment
             const expanded = [...sorted];
             expanded[expanded.length - 1] = { ...expanded[expanded.length - 1], end: newEnd };
-            // Try to pull in original segments
-            const origAfter = originalSegments.filter(s => s.start >= sorted[sorted.length - 1].end && s.start < newEnd);
+            // Try to pull in original segments from the same source
+            const blockSrcId2 = sorted[0]?.sourceId;
+            const srcSegs2 = blockSrcId2 ? (sources.find(s => s.id === blockSrcId2)?.segments || originalSegments) : originalSegments;
+            const origAfter = srcSegs2.filter(s => s.start >= sorted[sorted.length - 1].end && s.start < newEnd);
             const newSegs = origAfter.map(s => ({ ...s, id: uid() }));
             return { ...b, segments: [...expanded, ...newSegs], wasEdited: true };
           }
@@ -1196,7 +1421,7 @@ export default function OralHistoryEditor() {
       window.removeEventListener("mousemove", handleMove);
       window.removeEventListener("mouseup", handleUp);
     };
-  }, [trimming, originalSegments, pushUndo]);
+  }, [trimming, originalSegments, sources, pushUndo]);
 
   useEffect(() => { if (addingSpeaker && newSpkRef.current) newSpkRef.current.focus(); }, [addingSpeaker]);
   useEffect(() => { if (editingSpeakerId && editSpkRef.current) editSpkRef.current.focus(); }, [editingSpeakerId]);
@@ -1204,41 +1429,57 @@ export default function OralHistoryEditor() {
   useEffect(() => { if (editingSectionId && editSectionRef.current) editSectionRef.current.focus(); }, [editingSectionId]);
 
   /* ── Full project state for save ── */
-  const buildProjectState = useCallback(() => {
+  const serializeFileBlocks = useCallback((fileBlocks, fileSpeakers) => {
     const speakerMap = {};
-    speakers.forEach((s) => { speakerMap[s.id] = s.name; });
+    fileSpeakers.forEach((s) => { speakerMap[s.id] = s.name; });
+    return fileBlocks.map((b, i) => {
+      let effId = b.speaker;
+      if (!effId) { for (let j = i - 1; j >= 0; j--) { if (fileBlocks[j].speaker) { effId = fileBlocks[j].speaker; break; } } }
+      return {
+        order: i + 1,
+        speaker: effId ? (speakerMap[effId] || null) : null,
+        speakerId: b.speaker,
+        explicitSpeaker: !!b.speaker,
+        sectionId: b.sectionId || null,
+        type: b.type || "paragraph",
+        ...(b.type === "header" ? { headerText: b.text, level: b.level || 2 } : {}),
+        editHistory: b.editHistory || [],
+        text: b.segments.map((s) => s.text).join(" "),
+        wasEdited: b.wasEdited,
+        wasMoved: b.wasMoved,
+        segments: b.segments.map((seg) => ({
+          text: seg.text, originalText: seg.originalText,
+          sourceStart: +seg.start.toFixed(3), sourceEnd: +seg.end.toFixed(3),
+          duration: +((seg.end - seg.start).toFixed(3)),
+          originalIndex: seg.originalIndex,
+          sourceId: seg.sourceId || null,
+        })),
+      };
+    });
+  }, []);
+
+  const buildProjectState = useCallback(() => {
+    const allFiles = getAllFileStates();
     return {
-      version: 2,
+      version: 3,
       title: projectTitle,
-      sourceFile: audioName || "source.wav",
-      totalDuration: +(blocks.reduce((sum, b) => sum + b.segments.reduce((s2, seg) => s2 + (seg.end - seg.start), 0), 0)).toFixed(3),
-      speakers: speakers.map((s) => ({ id: s.id, name: s.name, color: s.color })),
-      sections: sections.map((s, i) => ({ id: s.id, name: s.name, order: i + 1 })),
-      blocks: blocks.map((b, i) => {
-        let effId = b.speaker;
-        if (!effId) { for (let j = i - 1; j >= 0; j--) { if (blocks[j].speaker) { effId = blocks[j].speaker; break; } } }
-        return {
-          order: i + 1,
-          speaker: effId ? (speakerMap[effId] || null) : null,
-          speakerId: b.speaker,
-          explicitSpeaker: !!b.speaker,
-          sectionId: b.sectionId || null,
-          type: b.type || "paragraph",
-          ...(b.type === "header" ? { headerText: b.text, level: b.level || 2 } : {}),
-          editHistory: b.editHistory || [],
-          text: b.segments.map((s) => s.text).join(" "),
-          wasEdited: b.wasEdited,
-          wasMoved: b.wasMoved,
-          segments: b.segments.map((seg) => ({
-            text: seg.text, originalText: seg.originalText,
-            sourceStart: +seg.start.toFixed(3), sourceEnd: +seg.end.toFixed(3),
-            duration: +((seg.end - seg.start).toFixed(3)),
-            originalIndex: seg.originalIndex,
-          })),
-        };
-      }),
+      sources: sources.map(s => ({
+        id: s.id, name: s.name, duration: s.duration || 0,
+        segments: (s.segments || []).map(seg => ({
+          text: seg.text, originalText: seg.originalText,
+          sourceStart: +seg.start.toFixed(3), sourceEnd: +seg.end.toFixed(3),
+          duration: +((seg.end - seg.start).toFixed(3)),
+          originalIndex: seg.originalIndex, sourceId: s.id,
+        })),
+      })),
+      files: allFiles.map(f => ({
+        id: f.id, name: f.name,
+        speakers: (f.speakers || []).map(s => ({ id: s.id, name: s.name, color: s.color })),
+        sections: (f.sections || []).map((s, i) => ({ id: s.id, name: s.name, order: i + 1 })),
+        blocks: serializeFileBlocks(f.blocks || [], f.speakers || []),
+      })),
     };
-  }, [blocks, speakers, sections, audioName, projectTitle]);
+  }, [getAllFileStates, sources, projectTitle, serializeFileBlocks]);
 
   /* ── Cloud sync via n8n webhooks ── */
   const cloudSave = useCallback(async () => {
@@ -1409,7 +1650,10 @@ Return ONLY valid JSON, no other text.`;
   /* ── Export: Markdown ── */
   const generateMarkdown = useCallback((sectionFilter) => {
     let md = `# ${projectTitle}\n\n`;
-    if (audioName) md += `*Source: ${audioName}*\n\n---\n\n`;
+    if (sources.length > 0) {
+      const sourceNames = sources.map(s => s.name).filter(Boolean).join(", ");
+      md += `*Sources: ${sourceNames}*\n\n---\n\n`;
+    }
 
     const renderBlocks = (blockList, blockIndices) => {
       let out = "";
@@ -1459,7 +1703,7 @@ Return ONLY valid JSON, no other text.`;
       });
     }
     return md;
-  }, [blocks, sections, getEffectiveSpeaker, blockText, audioName, projectTitle]);
+  }, [blocks, sections, getEffectiveSpeaker, blockText, sources, projectTitle]);
 
   const downloadMarkdown = useCallback((sectionFilter) => {
     const md = generateMarkdown(sectionFilter);
@@ -1477,11 +1721,17 @@ Return ONLY valid JSON, no other text.`;
   /* ── Export: Project JSON ── */
   const generateProject = useCallback(() => {
     const proj = buildProjectState();
-    proj.ffmpeg = blocks.flatMap((b) => b.segments).map((s, i) =>
-      `ffmpeg -ss ${s.start.toFixed(3)} -to ${s.end.toFixed(3)} -i "$INPUT" -c copy /tmp/seg_${String(i).padStart(4, "0")}.wav`
-    ).join("\n") + `\nprintf "file '%s'\\n" /tmp/seg_*.wav > /tmp/list.txt\nffmpeg -f concat -safe 0 -i /tmp/list.txt -c copy output.wav`;
+    // Build source variable mapping for multi-source FFmpeg
+    const sourceVars = {};
+    sources.forEach((s, i) => { sourceVars[s.id] = `INPUT_${i}`; });
+    const preamble = sources.map((s, i) => `# Source ${i}: ${s.name}\n# Set INPUT_${i} to the path of "${s.name}"`).join("\n");
+    const segCmds = blocks.flatMap((b) => b.segments).map((s, i) => {
+      const inputVar = sourceVars[s.sourceId] || "INPUT_0";
+      return `ffmpeg -ss ${s.start.toFixed(3)} -to ${s.end.toFixed(3)} -i "$${inputVar}" -c copy /tmp/seg_${String(i).padStart(4, "0")}.wav`;
+    }).join("\n");
+    proj.ffmpeg = preamble + "\n" + segCmds + `\nprintf "file '%s'\\n" /tmp/seg_*.wav > /tmp/list.txt\nffmpeg -f concat -safe 0 -i /tmp/list.txt -c copy output.wav`;
     return proj;
-  }, [buildProjectState, blocks]);
+  }, [buildProjectState, blocks, sources]);
 
   const downloadProject = useCallback(() => {
     const blob = new Blob([JSON.stringify(generateProject(), null, 2)], { type: "application/json" });
@@ -1507,7 +1757,6 @@ Return ONLY valid JSON, no other text.`;
         @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
         @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.4; } }
       `}</style>
-      <audio ref={audioRef} preload="auto" />
 
       {/* ── Header ── */}
       <header style={{ padding: "24px 36px", borderBottom: `1px solid ${C.border}`, background: C.surface }}>
@@ -1521,9 +1770,9 @@ Return ONLY valid JSON, no other text.`;
             </p>
           </div>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-            <UploadBtn onChange={handleAudioUpload} accept="audio/*" label={audioName ? `◆ ${audioName.slice(0, 18)}` : "↑ Audio"} />
-            <UploadBtn onChange={handleSubUpload} accept=".srt,.vtt,.txt,.json" label={subName ? `◆ ${subName.slice(0, 18)}` : "↑ Subtitles"} />
-            {audioUrl && !transcribing && (
+            <UploadBtn onChange={handleAudioUpload} accept="audio/*" label={sources.length > 0 ? `+ Source (${sources.length})` : "↑ Audio"} />
+            <UploadBtn onChange={handleSubUpload} accept=".srt,.vtt,.txt,.json" label="↑ Subtitles" />
+            {hasAudio && !transcribing && (
               <SmBtn onClick={() => transcribeAudio(!!transcriptionProgress)} accent>
                 {transcriptionProgress ? "⟳ Resume" : "⟳ Transcribe"}
               </SmBtn>
@@ -1588,7 +1837,7 @@ Return ONLY valid JSON, no other text.`;
           display: "flex", gap: 16, alignItems: "flex-end", flexWrap: "wrap",
         }}>
           <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
-            <label style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim }}>Project Title</label>
+            <label style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim }}>Workbook Title</label>
             <input value={projectTitle} onChange={(e) => setProjectTitle(e.target.value)}
               style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, padding: "4px 8px", background: C.surface, border: `1px solid ${C.border}`, borderRadius: 4, color: C.text, width: 200 }} />
           </div>
@@ -1642,7 +1891,7 @@ Return ONLY valid JSON, no other text.`;
           <Sep />
           <TBtn onClick={undo} disabled={!undoStack.length} label="Undo" k="⌘Z" />
           <Sep />
-          <TBtn onClick={playAll} disabled={!audioUrl} label="▶ Play" accent />
+          <TBtn onClick={playAll} disabled={!hasAudio} label="▶ Play" accent />
           <TBtn onClick={stopPlayback} label="■ Stop" />
           <Sep />
           <TBtn onClick={() => setShowSpeakers(!showSpeakers)} label={showSpeakers ? "◂ Speakers" : "▸ Speakers"} />
@@ -1654,6 +1903,58 @@ Return ONLY valid JSON, no other text.`;
           </span>
           <Sep />
           <TBtn onClick={() => setShowExport(!showExport)} label="Export" accent />
+        </div>
+      )}
+
+      {/* ── File Tabs ── */}
+      {files.length > 0 && (
+        <div style={{
+          padding: "0 36px", background: C.toolbar, borderBottom: `1px solid ${C.border}`,
+          display: "flex", gap: 0, alignItems: "stretch",
+          fontFamily: "'DM Mono', monospace", fontSize: 11,
+        }}>
+          {files.map(f => (
+            <div key={f.id}
+              onClick={() => switchToFile(f.id)}
+              onDoubleClick={() => { setEditingFileName(f.id); setEditingFileNameText(f.name); }}
+              style={{
+                padding: "7px 14px", cursor: "pointer", display: "flex", alignItems: "center", gap: 6,
+                borderBottom: f.id === activeFileId ? `2px solid ${C.accent}` : "2px solid transparent",
+                color: f.id === activeFileId ? C.accent : C.textDim,
+                transition: "all 0.12s",
+              }}
+            >
+              {editingFileName === f.id ? (
+                <input
+                  ref={fileNameInputRef}
+                  autoFocus
+                  value={editingFileNameText}
+                  onChange={(e) => setEditingFileNameText(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter") renameFile(f.id, editingFileNameText); if (e.key === "Escape") setEditingFileName(null); }}
+                  onBlur={() => renameFile(f.id, editingFileNameText)}
+                  onClick={(e) => e.stopPropagation()}
+                  style={{
+                    fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "1px 4px",
+                    background: C.surface, border: `1px solid ${C.accent}`, borderRadius: 3,
+                    color: C.text, width: 80,
+                  }}
+                />
+              ) : (
+                <span>{f.name}</span>
+              )}
+              {files.length > 1 && editingFileName !== f.id && (
+                <span
+                  onClick={(e) => { e.stopPropagation(); if (confirm(`Delete "${f.name}"?`)) deleteFile(f.id); }}
+                  style={{ fontSize: 9, opacity: 0.4, cursor: "pointer", lineHeight: 1 }}
+                  title="Delete file"
+                >x</span>
+              )}
+            </div>
+          ))}
+          <div onClick={createNewFile}
+            style={{ padding: "7px 10px", cursor: "pointer", color: C.textDim, fontSize: 13, display: "flex", alignItems: "center" }}
+            title="New file"
+          >+</div>
         </div>
       )}
 
@@ -1882,6 +2183,7 @@ Return ONLY valid JSON, no other text.`;
                   segments: chunkData.segments.map(s => ({
                     id: uid(), text: s.text, originalText: s.originalText || s.text,
                     start: s.start, end: s.end, originalIndex: s.originalIndex || 0,
+                    sourceId: s.sourceId || null,
                   })),
                 };
                 setBlocks(prev => [...prev, newBlock]);
@@ -2052,21 +2354,21 @@ Return ONLY valid JSON, no other text.`;
                       {block.segments.map((seg, si) => (
                         <span key={seg.id || si}
                           onClick={(e) => {
-                            if (audioUrl && audioRef.current) {
+                            const segAudio = getAudio(seg.sourceId);
+                            if (segAudio) {
                               e.stopPropagation();
-                              audioRef.current.currentTime = seg.start;
-                              audioRef.current.play();
+                              playSegAudio(seg);
                               setPlaying(block.id);
                               setPlayingSegId(seg.id);
                             }
                           }}
                           style={{
-                            cursor: audioUrl ? "pointer" : "default",
+                            cursor: hasAudio ? "pointer" : "default",
                             background: playingSegId === seg.id ? C.accentDim : "transparent",
                             borderRadius: 2, padding: "0 1px",
                             transition: "background 0.15s",
                           }}
-                          title={audioUrl ? `${fmtTime(seg.start)} — ${fmtTime(seg.end)}` : undefined}
+                          title={hasAudio ? `${fmtTime(seg.start)} — ${fmtTime(seg.end)}` : undefined}
                         >
                           {seg.text}{si < block.segments.length - 1 ? " " : ""}
                         </span>
@@ -2077,7 +2379,7 @@ Return ONLY valid JSON, no other text.`;
                   {/* Hover actions */}
                   {!isEditing && isSelected && (
                     <div style={{ display: "flex", gap: 6, marginTop: 8, flexWrap: "wrap" }}>
-                      {audioUrl && <SmBtn onClick={(e) => { e.stopPropagation(); playBlock(block); }}>▶ Play</SmBtn>}
+                      {hasAudio && <SmBtn onClick={(e) => { e.stopPropagation(); playBlock(block); }}>▶ Play</SmBtn>}
                       <SmBtn onClick={(e) => { e.stopPropagation(); startEdit(block); }}>✎ Edit</SmBtn>
                       <SmBtn onClick={(e) => { e.stopPropagation(); pushUndo(); splitBlock(block.id, Math.floor(text.length / 2)); }}>Split ½</SmBtn>
                       <SmBtn onClick={(e) => { e.stopPropagation(); splitBySentence(block.id); }}>Split sentences</SmBtn>
@@ -2092,7 +2394,7 @@ Return ONLY valid JSON, no other text.`;
                     </div>
                   )}
                   {/* Trim handles */}
-                  {!isEditing && audioUrl && block.segments.length > 0 && (
+                  {!isEditing && hasAudio && block.segments.length > 0 && (
                     <>
                       <div
                         onMouseDown={(e) => {
@@ -2185,7 +2487,7 @@ Return ONLY valid JSON, no other text.`;
         </div>
 
         {/* ── Scrub Bar ── */}
-        {audioUrl && hasContent && (
+        {hasAudio && hasContent && activeSourceId && (
           <div style={{
             position: "fixed", bottom: 40, left: "50%", transform: "translateX(-50%)",
             background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8,
@@ -2193,13 +2495,20 @@ Return ONLY valid JSON, no other text.`;
             boxShadow: "0 2px 12px rgba(0,0,0,0.1)", zIndex: 50, minWidth: 400,
             fontFamily: "'DM Mono', monospace", fontSize: 10,
           }}>
+            {sources.length > 1 && (
+              <span style={{ color: C.textDim, fontSize: 9, maxWidth: 60, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+                title={sources.find(s => s.id === activeSourceId)?.name}>
+                {sources.find(s => s.id === activeSourceId)?.name?.slice(0, 10)}
+              </span>
+            )}
             <span style={{ color: C.textDim, minWidth: 50 }}>{fmtTime(currentTime)}</span>
             <div
               onClick={(e) => {
                 const rect = e.currentTarget.getBoundingClientRect();
                 const ratio = (e.clientX - rect.left) / rect.width;
                 const newTime = ratio * audioDuration;
-                if (audioRef.current) { audioRef.current.currentTime = newTime; setCurrentTime(newTime); }
+                const audio = getAudio(activeSourceId);
+                if (audio) { audio.currentTime = newTime; setCurrentTime(newTime); }
               }}
               style={{
                 flex: 1, height: 6, background: C.raised, borderRadius: 3, cursor: "pointer", position: "relative",
@@ -2211,7 +2520,7 @@ Return ONLY valid JSON, no other text.`;
               }} />
             </div>
             <span style={{ color: C.textDim, minWidth: 50, textAlign: "right" }}>{fmtTime(audioDuration)}</span>
-            <button onClick={() => { if (audioRef.current) { if (audioRef.current.paused) audioRef.current.play(); else audioRef.current.pause(); } }}
+            <button onClick={() => { const a = getAudio(activeSourceId); if (a) { if (a.paused) a.play(); else a.pause(); } }}
               style={{ background: "none", border: "none", color: C.accent, cursor: "pointer", fontSize: 14, padding: "0 4px" }}>
               {playing ? "■" : "▶"}
             </button>
@@ -2309,6 +2618,16 @@ Return ONLY valid JSON, no other text.`;
                 <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: C.textDim, letterSpacing: "0.06em", textTransform: "uppercase" }}>Source Transcript</span>
                 <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: C.textDim }}>{originalSegments.length} segments</span>
               </div>
+              {sources.length > 1 && (
+                <div style={{ display: "flex", gap: 4, marginBottom: 6, flexWrap: "wrap" }}>
+                  <SmBtn onClick={() => setSourceFilter("all")} accent={sourceFilter === "all"}>All Sources</SmBtn>
+                  {sources.map(s => (
+                    <SmBtn key={s.id} onClick={() => setSourceFilter(s.id)} accent={sourceFilter === s.id}>
+                      {s.name.slice(0, 12)}
+                    </SmBtn>
+                  ))}
+                </div>
+              )}
               <input value={sourceSearch} onChange={(e) => setSourceSearch(e.target.value)}
                 placeholder="Search transcript..."
                 style={{ width: "100%", fontFamily: "'DM Mono', monospace", fontSize: 11, padding: "5px 8px", background: C.raised, border: `1px solid ${C.border}`, borderRadius: 4, color: C.text }}
@@ -2320,32 +2639,47 @@ Return ONLY valid JSON, no other text.`;
             </div>
             <div style={{ flex: 1, overflowY: "auto", padding: "6px 0" }}>
               {(() => {
-                // Group originalSegments into ~15s chunks
+                // Filter by source first
+                const filteredSegs = sourceFilter === "all"
+                  ? originalSegments
+                  : originalSegments.filter(s => s.sourceId === sourceFilter);
+                // Group into ~15s chunks, never spanning different sources
                 const chunks = [];
                 let chunk = [];
-                let chunkStart = originalSegments[0]?.start || 0;
-                for (const seg of originalSegments) {
-                  chunk.push(seg);
-                  if (seg.end - chunkStart >= 15 || seg === originalSegments[originalSegments.length - 1]) {
-                    chunks.push({ segments: [...chunk], start: chunkStart, end: seg.end });
-                    chunk = [];
-                    chunkStart = seg.end;
+                let chunkStart = filteredSegs[0]?.start || 0;
+                let chunkSourceId = filteredSegs[0]?.sourceId;
+                for (const seg of filteredSegs) {
+                  if (chunk.length > 0 && seg.sourceId !== chunkSourceId) {
+                    // Source boundary — flush current chunk
+                    chunks.push({ segments: [...chunk], start: chunkStart, end: chunk[chunk.length - 1].end, sourceId: chunkSourceId });
+                    chunk = [seg];
+                    chunkStart = seg.start;
+                    chunkSourceId = seg.sourceId;
+                  } else {
+                    chunk.push(seg);
+                    if (seg.end - chunkStart >= 15 || seg === filteredSegs[filteredSegs.length - 1]) {
+                      chunks.push({ segments: [...chunk], start: chunkStart, end: seg.end, sourceId: chunkSourceId });
+                      chunk = [];
+                      chunkStart = seg.end;
+                      chunkSourceId = seg.sourceId;
+                    }
                   }
                 }
                 // Filter by search
                 const filtered = sourceSearch.trim()
                   ? chunks.filter(c => c.segments.some(s => s.text.toLowerCase().includes(sourceSearch.toLowerCase())))
                   : chunks;
-                // Filter by view
+                // Filter by view — include sourceId in used key
                 const usedTimes = new Set();
-                blocks.forEach(b => b.segments.forEach(s => usedTimes.add(`${s.start.toFixed(3)}-${s.end.toFixed(3)}`)));
+                blocks.forEach(b => b.segments.forEach(s => usedTimes.add(`${s.sourceId || ""}-${s.start.toFixed(3)}-${s.end.toFixed(3)}`)));
                 const viewFiltered = sourceView === "unused"
-                  ? filtered.filter(c => !c.segments.every(s => usedTimes.has(`${s.start.toFixed(3)}-${s.end.toFixed(3)}`)))
+                  ? filtered.filter(c => !c.segments.every(s => usedTimes.has(`${s.sourceId || ""}-${s.start.toFixed(3)}-${s.end.toFixed(3)}`)))
                   : filtered;
 
                 return viewFiltered.map((chunk, i) => {
                   const chunkText = chunk.segments.map(s => s.text).join(" ");
-                  const isUsed = chunk.segments.every(s => usedTimes.has(`${s.start.toFixed(3)}-${s.end.toFixed(3)}`));
+                  const isUsed = chunk.segments.every(s => usedTimes.has(`${s.sourceId || ""}-${s.start.toFixed(3)}-${s.end.toFixed(3)}`));
+                  const srcName = sources.find(s => s.id === chunk.sourceId)?.name;
                   return (
                     <div key={i}
                       draggable
@@ -2363,6 +2697,7 @@ Return ONLY valid JSON, no other text.`;
                     >
                       <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: C.accent, marginBottom: 3 }}>
                         {fmtTime(chunk.start)} — {fmtTime(chunk.end)}
+                        {sources.length > 1 && srcName && <span style={{ marginLeft: 6, color: C.textDim }}>{srcName.slice(0, 15)}</span>}
                         {isUsed && <span style={{ marginLeft: 6, color: C.textDim }}>(used)</span>}
                       </div>
                       <p style={{ fontFamily: "'Newsreader', Georgia, serif", fontSize: 12, lineHeight: 1.5, color: C.text, margin: 0 }}>
